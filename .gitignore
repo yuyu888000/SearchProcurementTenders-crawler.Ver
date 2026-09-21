@@ -1,3 +1,7 @@
 node_modules/
 build/
 .cache/
+
+# 一次性的探測／匯出腳本，不進版控
+_export.mjs
+_probe_atm.mjs
