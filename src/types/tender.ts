@@ -107,3 +107,54 @@ export interface ArchiveSearchParams {
   /** true（預設）只比對機關名＋標案名；false 會比對公告全文，命中量暴增 */
   matchNameOnly?: boolean;
 }
+
+/** 標的分類三大類，對應官網 radProctrgCate 與 proctrgCode1/2/3 欄位 */
+export type ProctrgCateName = '工程類' | '財物類' | '勞務類';
+
+/** 一筆標的分類代碼（來自 /ccs/queryCPCsByType） */
+export interface CpcCategory {
+  /** 分類代碼，例：8672 */
+  code: string;
+  /** 送查詢用的內部 pk，例：50003003。⚠️ 官網送出的是這個，不是 code */
+  pk: string;
+  /** 分類名稱，例：工程服務 */
+  label: string;
+  cate: ProctrgCateName;
+}
+
+/** 標的分類查詢的一筆結果 */
+export interface ProctrgTender {
+  /** 去重用的鍵（優先用內頁連結） */
+  key: string;
+  orgName: string;
+  caseId: string;
+  /** 標案名稱（藏在 pageCode2Img 的 JS 裡，已抽出） */
+  name: string;
+  /** 招標方式 */
+  tenderWay: string;
+  /** 公告日期（民國） */
+  publishDate: string;
+  /** 決標金額字串，招標公告模式下為空 */
+  awardAmount: string;
+  /** 標案內頁連結（可直接餵 get_tender_detail） */
+  link: string;
+  /** 這筆是哪個標的分類查到的 */
+  matchedCode: string;
+  matchedLabel: string;
+}
+
+export interface ProctrgSearchParams {
+  /** 分類內部 pk */
+  pk: string;
+  cate: ProctrgCateName;
+  /** 招標 or 決標 */
+  kind: '招標' | '決標';
+  /** 標案狀態，僅決標模式有意義 */
+  tenderStatus?: string;
+  tenderWay?: string;
+  /** 公告日期起迄，民國 yyyMMdd 整數 */
+  publishFrom: number;
+  publishTo: number;
+  /** 最多翻幾頁 */
+  maxPages?: number;
+}

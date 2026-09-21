@@ -86,3 +86,24 @@ export function calculateTenderPeriod(startDate: Date, endDate: Date): string {
   const days = Math.floor(diff / (1000 * 60 * 60 * 24));
   return `${days} 天`;
 }
+
+/**
+ * 民國 yyyMMdd 整數轉成標的分類查詢要的「西元」字串（1150701 → 2026/07/01）。
+ *
+ * ⚠️ 標的分類查詢頁畫面上填的是民國（115/07/01），但它的前端驗證是
+ *    `if (y1 < 2010) 擋掉`，也就是送出時已被換成西元。直接送民國年會被判為
+ *    「99 年以前」，伺服器不報錯、直接回一張空的查詢表單頁（很容易誤判成 0 筆）。
+ */
+export function rocNumberToADSlash(n: number): string {
+  const y = Math.floor(n / 10000) + 1911;
+  const m = Math.floor((n % 10000) / 100);
+  const d = n % 100;
+  return `${y}/${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}`;
+}
+
+/** 兩個民國 yyyMMdd 整數相差幾天（官網未登入時上限 186 天） */
+export function daysBetweenROC(from: number, to: number): number {
+  const toDate = (n: number) =>
+    new Date(Math.floor(n / 10000) + 1911, Math.floor((n % 10000) / 100) - 1, n % 100);
+  return Math.round(Math.abs(toDate(to).getTime() - toDate(from).getTime()) / 86400000);
+}

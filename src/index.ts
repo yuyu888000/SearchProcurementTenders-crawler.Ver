@@ -3,7 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fetchAndFilterTenders } from "./services/tender-service.js";
 import { fetchTenderDetails, KEY_FIELDS, MAX_FETCH_PER_CALL } from "./services/detail-crawler.js";
-import { toROCNumber, formatROCNumber } from "./utils/date.js";
+import { toROCNumber, formatROCNumber, daysBetweenROC } from "./utils/date.js";
+import { resolveCodes } from "./services/cpc-catalog.js";
+import { searchByCategories } from "./services/proctrg-service.js";
+import { ProctrgCrawlerService } from "./services/proctrg-crawler.js";
 import { searchArchive, parseYears, currentROCYear, MIN_ROC_YEAR, MAX_YEARS_PER_CALL } from "./services/archive-service.js";
 import { TenderStatusType } from "./types/tender.js";
 
@@ -14,9 +17,13 @@ const server = new McpServer({
   // 行為規則放 server instructions：任何 client 掛上這支 MCP 就生效，不依賴 skill 觸發或記憶命中
   instructions: `查台灣政府採購標案的固定作法：
 
-1. 兩個查詢工具的涵蓋範圍**互不重疊**，不可互相取代：
+1. 三個查詢工具的涵蓋範圍**互不重疊**，不可互相取代：
    - search_tenders：只有「等標期內」還能投標的案子（官網 dateType=isSpdt）
    - search_tender_archive：全文檢索電子公報，民國 88 年起，**含已截止的歷史案**
+   - search_tenders_by_category：**用標的分類代碼**查（民國 99 年起，招標／決標皆可）。
+     只有這支能真的按分類篩選，而且**會翻頁抓完整筆數**（另兩支各有 100 筆上限）。
+     使用者一講到標的分類代碼（52、521、8672…）或「某一類的案子全部」，就用這支，
+     不要退回用關鍵字猜。它一次日期區間上限 186 天，超過要自行拆段。
 2. 使用者沒有明確限定範圍時，**兩個工具都要跑**，並把結果分成兩段回報：
    「等標期內（還能投標）」與「已截止／歷史案（僅供參考，不能投標）」。
    每段都要標明筆數；某段是 0 筆也要明寫「0 筆」，**不可靜默省略**（省略會被誤讀成沒查過）。
@@ -25,7 +32,11 @@ const server = new McpServer({
    不要把「工具查不到」講成「這個案子不存在」。
 4. 判斷案子性質與可投性，用 get_tender_detail 看「標的分類」與「廠商資格摘要」兩個欄位，
    不要只靠標案名稱關鍵字（分類碼比關鍵字可靠，但資格摘要才決定誰能投）。
-5. get_tender_detail 受網站流量控制，一次最多 8 筆未快取的案子。遇到驗證碼頁就附連結
+   要「整批」依分類篩選時改用 search_tenders_by_category，不要拿 get_tender_detail 逐筆掃。
+5. 官網這幾個查詢頁都沒有「縣市」欄位。要依縣市篩選只能比對機關名稱（會有偏差：
+   中央機關在該縣市的案子撈不到、該縣市機關在外縣市的案子會被留下），
+   精確的履約地點要用 get_tender_detail 逐筆確認。**回報時要講清楚用的是哪一種**。
+6. get_tender_detail 受網站流量控制，一次最多 8 筆未快取的案子。遇到驗證碼頁就附連結
    請使用者人工開啟，**不要重試迴圈，也不要試圖繞過驗證碼**。`,
 });
 
@@ -242,6 +253,115 @@ server.tool(
       return { content: [{ type: "text", text: out }] };
     } catch (error: any) {
       return { content: [{ type: "text", text: `全文檢索失敗: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  "search_tenders_by_category",
+  `Search web.pcc.gov.tw by 標的分類 (procurement CATEGORY CODE, e.g. 8672 工程服務 / 521 建築施工服務) over an announcement-date range — the ONLY tool here that filters by category instead of guessing from the tender name. Use it whenever the user names category codes, or wants "all tenders of this kind" rather than a keyword match.
+
+Unlike search_tender_archive this endpoint paginates properly, so it returns the COMPLETE result set (not just the newest 100) and reports the site's own total for cross-checking. Covers 招標公告 and 決標公告 (決標 needs tenderKind='決標'), ROC year 99 onward.
+
+Limits: the site allows at most ${ProctrgCrawlerService.MAX_DAY_SPAN} days between publishFrom and publishTo without login — a wider range is rejected with instructions to split it. The site has no 縣市 field, so orgNameIncludes filters on 機關名稱 text (a 臺中市 agency may still procure elsewhere, and a central agency may procure in 臺中 — say so when reporting). Returns pre-formatted Markdown; output it verbatim.`,
+  {
+    categoryCodes: z.array(z.string()).min(1).describe("標的分類代碼，例 ['52','521','522','867','8671','8672','8673','8674']。上層碼與子碼可同時給，結果會自動去重。"),
+    categoryType: z.enum(["工程類", "財物類", "勞務類"]).optional().describe("代碼所屬大類。同一代碼若在多個大類重複出現才需要指定。"),
+    tenderKind: z.enum(["招標", "決標"]).optional().describe("查招標公告或決標公告，預設 招標。"),
+    awardStatus: z.enum(["不限", "決標公告", "無法決標", "撤銷公告"]).optional().describe("標案狀態，只在 tenderKind='決標' 時有作用，預設 不限。"),
+    publishFrom: z.string().describe("公告日期起（民國或西元皆可：115/07/01、1150701、2026-07-01）"),
+    publishTo: z.string().describe("公告日期迄（同上格式）"),
+    tenderWay: z.string().optional().describe("招標方式代碼，例 TENDER_WAY_1（公開招標）。預設不限。"),
+    orgNameIncludes: z.array(z.string()).optional().describe("只留機關名稱含其中任一字串的案子，例 ['臺中','台中','彰化','雲林','南投']。注意這是機關名稱、不是履約地點。"),
+    excludeTitleKeywords: z.array(z.string()).optional().describe("標案名稱含其中任一字串就排除，例 ['變更設計']。"),
+    maxPages: z.number().optional().describe("每個分類最多翻幾頁（每頁 100 筆），預設 30。"),
+  },
+  async ({ categoryCodes, categoryType, tenderKind, awardStatus, publishFrom, publishTo, tenderWay, orgNameIncludes, excludeTitleKeywords, maxPages }) => {
+    try {
+      const from = toROCNumber(publishFrom);
+      const to = toROCNumber(publishTo);
+      const badDates = [!from && `publishFrom="${publishFrom}"`, !to && `publishTo="${publishTo}"`].filter(Boolean);
+      if (badDates.length > 0) {
+        return { content: [{ type: "text", text: `日期格式無法解析：${badDates.join('、')}。請用 115/07/01 或 2026-07-01 這類格式。` }] };
+      }
+      if (from! > to!) {
+        return { content: [{ type: "text", text: `公告日期起 ${formatROCNumber(from!)} 晚於迄 ${formatROCNumber(to!)}，請對調。` }] };
+      }
+      const span = daysBetweenROC(from!, to!);
+      if (span > ProctrgCrawlerService.MAX_DAY_SPAN) {
+        return { content: [{ type: "text", text: `公告日期區間 ${formatROCNumber(from!)} ~ ${formatROCNumber(to!)} 共 ${span} 天，超過官網未登入時的 ${ProctrgCrawlerService.MAX_DAY_SPAN} 天上限（超過會被導去全文檢索頁）。請拆成多段分別查詢後合併。` }] };
+      }
+
+      const { found, missing, ambiguous } = await resolveCodes(categoryCodes, categoryType);
+      if (ambiguous.length > 0) {
+        const lines = ambiguous.map(a => `${a.code}（${a.cates.join('、')}）`).join('；');
+        return { content: [{ type: "text", text: `以下代碼在多個大類都存在，請加上 categoryType 指定：${lines}` }] };
+      }
+      if (found.length === 0) {
+        return { content: [{ type: "text", text: `給的代碼都查不到：${missing.join('、')}。標的分類代碼可在官網「標的分類查詢」頁的下拉選單看到。` }] };
+      }
+
+      const kind = tenderKind ?? '招標';
+      const STATUS_MAP: Record<string, string> = {
+        '不限': 'TENDER_STATUS_0', '決標公告': 'TENDER_STATUS_1',
+        '無法決標': 'TENDER_STATUS_2', '撤銷公告': 'TENDER_STATUS_3',
+      };
+
+      const { results, stats, dedupedBeforeFilter, droppedByOrg, droppedByExclude } = await searchByCategories({
+        cats: found,
+        kind,
+        tenderStatus: STATUS_MAP[awardStatus ?? '不限'],
+        tenderWay,
+        publishFrom: from!,
+        publishTo: to!,
+        orgNameIncludes,
+        excludeTitleKeywords,
+        maxPages,
+      });
+
+      const scope = [
+        `公告日 ${formatROCNumber(from!)} ~ ${formatROCNumber(to!)}（${span} 天）`,
+        `${kind}${kind === '決標' ? `／${awardStatus ?? '不限'}` : ''}`,
+        `分類 ${found.map(f => f.code).join('、')}`,
+      ].join('｜');
+
+      let out = `### 標的分類查詢結果（共 ${results.length} 筆）\n\n> 範圍：${scope}\n\n`;
+
+      out += `#### 各分類命中數\n\n| 代碼 | 名稱 | 官網總筆數 | 實際抓取 |\n| :--- | :--- | ---: | ---: |\n`;
+      stats.forEach(s => {
+        out += `| ${s.code} | ${s.label} | ${s.siteTotal} | ${s.fetched}${s.truncated ? ' ⚠️未抓完' : ''} |\n`;
+      });
+      out += `\n合計 ${stats.reduce((n, s) => n + s.fetched, 0)} 筆，跨分類去重後 ${dedupedBeforeFilter} 筆`;
+      if (droppedByOrg > 0) out += `，機關名稱篩掉 ${droppedByOrg} 筆`;
+      if (droppedByExclude > 0) out += `，標案名稱排除字篩掉 ${droppedByExclude} 筆`;
+      out += `，最終 ${results.length} 筆。\n\n`;
+
+      if (missing.length > 0) out += `> 注意：代碼 ${missing.join('、')} 查無此分類，已略過。\n\n`;
+      if (orgNameIncludes?.length) {
+        out += `> 縣市是用「機關名稱」比對（${orgNameIncludes.join('、')}）。官網此查詢沒有履約地點欄位，中央機關在該縣市的案子不會被撈到，該縣市機關在外縣市的案子則會被留下。要精確判斷履約地點需用 get_tender_detail 逐筆確認。\n\n`;
+      }
+
+      if (results.length === 0) {
+        out += `套用條件後 0 筆。\n`;
+        return { content: [{ type: "text", text: out }] };
+      }
+
+      out += `#### 明細\n\n| 機關 | 案號 | 標案名稱 | 招標方式 | 公告日 | ${kind === '決標' ? '決標金額' : '預算金額'} | 分類 | 連結 |\n`;
+      out += `| :--- | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n`;
+      results.forEach(r => {
+        const title = r.name.length > 35 ? r.name.slice(0, 33) + '...' : r.name;
+        out += `| ${r.orgName} | **${r.caseId}** | ${title} | ${r.tenderWay} | ${r.publishDate} | ${r.awardAmount || '-'} | ${r.matchedCode} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
+      });
+
+      const anyTruncated = stats.some(s => s.truncated);
+      if (anyTruncated) {
+        out += `\n> **註：有分類未抓完（已達 maxPages 上限）。請調高 maxPages 或縮短日期區間。**\n`;
+      }
+      out += `\n> 「查看」連結可直接餵給 get_tender_detail 取廠商資格與履約地點（一次最多 8 筆）。\n`;
+
+      return { content: [{ type: "text", text: out }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `標的分類查詢失敗: ${error.message}` }] };
     }
   }
 );
