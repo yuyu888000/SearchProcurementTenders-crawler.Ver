@@ -162,3 +162,36 @@ export interface ProctrgSearchParams {
   /** 最多翻幾頁 */
   maxPages?: number;
 }
+
+/** 公開閱覽查詢的採購性質（官網 radProctrgCate）。與標的分類查詢同一組名稱，但那支另有 proctrgCode 欄位，兩者不共用 */
+export type TpReadCate = '工程類' | '財物類' | '勞務類';
+
+/** 公開閱覽查詢（readTpRead）的一筆招標文件公開閱覽公告 */
+export interface TpReadTender {
+  /** 去重用的鍵（優先用內頁連結） */
+  key: string;
+  orgName: string;
+  caseId: string;
+  /** 標案名稱（藏在 pageCode2Img 的 JS 裡，已抽出） */
+  name: string;
+  /** 公告次數：01 為首次、02 以上為更正閱覽公告 */
+  noticeTimes: string;
+  /** 公開閱覽期間原文，例「115/09/18 ─ 115/09/22」 */
+  period: string;
+  /** 公開閱覽起日，民國 yyyMMdd 整數；解析不出來為 null */
+  reviewFrom: number | null;
+  /** 公開閱覽迄日，同上 */
+  reviewTo: number | null;
+  /** 公開閱覽公告內頁連結（showTpReadDetail，⚠️ 不是標案內頁，別餵 get_tender_detail） */
+  link: string;
+}
+
+export interface TpReadSearchParams {
+  /** 公開閱覽期間起迄，民國 yyyMMdd 整數。官網是「期間有交集就命中」 */
+  reviewFrom: number;
+  reviewTo: number;
+  /** 採購性質（官網 radProctrgCate），未給＝不限。三類互斥且合計等於不限 */
+  cate?: TpReadCate;
+  /** 最多翻幾頁 */
+  maxPages?: number;
+}

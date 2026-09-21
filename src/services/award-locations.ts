@@ -119,6 +119,21 @@ export function countyFromOrgName(orgName: string): string | null {
   return names.find(n => org.startsWith(n)) ?? names.find(n => org.startsWith(n.slice(0, 2))) ?? null;
 }
 
+/**
+ * 機關名稱裡出現的縣市：先比開頭（countyFromOrgName），再往整串找。
+ * 「台灣電力股份有限公司台中區營業處」→臺中市、「衛生福利部南投啟智教養院」→南投縣。
+ * 比 countyFromOrgName 寬，但同樣只是機關名稱比對，不等於履約地點
+ * （「農業部林業及自然保育署臺中分署」會算臺中市，實際案子可能在別處）。
+ */
+export function countyInOrgName(orgName: string): string | null {
+  const org = normalizeCountyName(orgName);
+  const names = [...COUNTY_CODES.keys()];
+  return countyFromOrgName(orgName)
+    ?? names.find(n => org.includes(n))
+    ?? names.find(n => org.includes(n.slice(0, 2)))
+    ?? null;
+}
+
 /** 縣市 → 該縣市全部代碼（依官網順序，舊制代碼在最後） */
 const COUNTY_CODES: Map<string, ExecLocationOption[]> = (() => {
   const m = new Map<string, ExecLocationOption[]>();

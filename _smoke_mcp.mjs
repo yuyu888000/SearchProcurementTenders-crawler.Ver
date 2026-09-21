@@ -28,7 +28,7 @@ console.log('註冊的工具：');
 for (const t of tools) {
   console.log(`  - ${t.name}  參數: ${Object.keys(t.inputSchema?.properties ?? {}).join(', ')}`);
 }
-const expected = ['search_tenders', 'get_tender_detail', 'search_tender_archive', 'search_awards', 'get_award_detail', 'find_awards_by_vendor', 'resolve_award_vendors'];
+const expected = ['search_tenders', 'get_tender_detail', 'search_tender_archive', 'search_awards', 'get_award_detail', 'find_awards_by_vendor', 'resolve_award_vendors', 'search_public_review'];
 const missing = expected.filter(n => !tools.some(t => t.name === n));
 for (const n of expected) console.log(missing.includes(n) ? `FAIL  找不到 ${n}` : `PASS  ${n} 已註冊`);
 process.exit(missing.length === 0 ? 0 : 1);

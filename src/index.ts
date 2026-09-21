@@ -13,7 +13,8 @@ import {
   queryAwardsByLocations, queryAwardsByVendor, exportAwards, isValidRocNumber, rocNumberToWestern, todayRocNumber, rocDaysBetween,
   AWARD_DATA_START_ROC, MAX_RANGE_DAYS,
 } from "./services/award-service.js";
-import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/award-locations.js";
+import { resolveCounties, listCounties, OTHER_LOCATION_CODE, countyInOrgName } from "./services/award-locations.js";
+import { TpReadCrawlerService } from "./services/tpread-crawler.js";
 import { ExecLocationOption } from "./types/award.js";
 import {
   fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
@@ -44,13 +45,19 @@ const server = new McpServer({
   // 行為規則放 server instructions：任何 client 掛上這支 MCP 就生效，不依賴 skill 觸發或記憶命中
   instructions: `查台灣政府採購標案的固定作法：
 
-1. 三個查詢工具的涵蓋範圍**互不重疊**，不可互相取代：
+1. 四個查詢工具的涵蓋範圍**互不重疊**，不可互相取代：
    - search_tenders：只有「等標期內」還能投標的案子（官網 dateType=isSpdt）
    - search_tender_archive：全文檢索電子公報，民國 88 年起，**含已截止的歷史案**
    - search_tenders_by_category：**用標的分類代碼**查（民國 99 年起，招標／決標皆可）。
      只有這支能真的按分類篩選，而且**會翻頁抓完整筆數**（另兩支各有 100 筆上限）。
      使用者一講到標的分類代碼（52、521、8672…）或「某一類的案子全部」，就用這支，
      不要退回用關鍵字猜。它一次日期區間上限 186 天，超過要自行拆段。
+   - search_public_review：**招標文件公開閱覽公告**（官網獨立的公開閱覽查詢）。
+     這是招標前先把文件掛出來給廠商表示意見的階段，**還不能投標**，
+     另外三支一支都查不到。使用者講「公開閱覽」「還沒公告但快要標的案」就用這支；
+     它的日期是「公開閱覽期間」，**期間有交集就算命中**（不是只比起日）。
+     要只看工程案就帶 category='工程類'（採購性質，官網端篩，三類互斥合計等於不限），
+     這和 search_tenders_by_category 的標的分類代碼是兩回事，別混用。
 2. 使用者沒有明確限定範圍時，**兩個工具都要跑**，並把結果分成兩段回報：
    「等標期內（還能投標）」與「已截止／歷史案（僅供參考，不能投標）」。
    每段都要標明筆數；某段是 0 筆也要明寫「0 筆」，**不可靜默省略**（省略會被誤讀成沒查過）。
@@ -60,8 +67,8 @@ const server = new McpServer({
 4. 判斷案子性質與可投性，用 get_tender_detail 看「標的分類」與「廠商資格摘要」兩個欄位，
    不要只靠標案名稱關鍵字（分類碼比關鍵字可靠，但資格摘要才決定誰能投）。
    要「整批」依分類篩選時改用 search_tenders_by_category，不要拿 get_tender_detail 逐筆掃。
-5. search_tenders／search_tender_archive／search_tenders_by_category 這三支的查詢頁
-   都沒有「縣市」欄位。要依縣市篩選只能比對機關名稱（會有偏差：中央機關在該縣市的
+5. search_tenders／search_tender_archive／search_tenders_by_category／search_public_review
+   這四支的查詢頁都沒有「縣市」欄位。要依縣市篩選只能比對機關名稱（會有偏差：中央機關在該縣市的
    案子撈不到、該縣市機關在外縣市的案子會被留下），精確的履約地點要用
    get_tender_detail 逐筆確認。**回報時要講清楚用的是哪一種**。
    **search_awards 例外**：它有官網的履約地點（縣市）篩選，查決標案的縣市直接用它，見第 7 條。
@@ -1395,6 +1402,97 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`同義詞擴充查詢失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "search_public_review",
+  `Search web.pcc.gov.tw 公開閱覽查詢 (readTpRead) — 招標文件公開閱覽公告 over a 公開閱覽期間 date range, optionally narrowed to counties inferred from 機關名稱. This is a SEPARATE announcement pool from 招標公告: an agency publishes its draft tender documents for vendors to comment on BEFORE the real tender is announced, so these cases CANNOT be bid on yet — none of the other tools here return them, and search_tenders will not find them. Use it for "哪些案子現在/某段期間在公開閱覽", "某縣市的公開閱覽案", or to catch upcoming work earlier than 招標公告.
+
+The date range matches by OVERLAP: a case whose 公開閱覽期間 is 115/09/17─115/09/30 is returned for a 115/09/19~115/09/19 query. Paginates properly, so it returns the COMPLETE set and reports the site's own total for cross-checking.
+
+category (採購性質 工程類／財物類／勞務類) is filtered BY THE SITE, not locally — the three are mutually exclusive and add up to the unfiltered total, so it is a reliable pre-filter. Note this is the coarse 採購性質, not the 標的分類 code that search_tenders_by_category uses.
+
+The site has NO 縣市 field, so counties are inferred from 機關名稱 (「臺中市政府…」、「台電台中區營業處」→臺中市). Central agencies and SOEs whose name carries no county cannot be attributed at all — the output reports how many rows those are, and they are excluded when counties is given. This is agency name, NOT 履約地點; confirm the real location on the announcement's own detail page. Returns pre-formatted Markdown; output it verbatim.`,
+  {
+    reviewFrom: z.string().describe("公開閱覽期間起（民國或西元皆可：115/09/01、1150901、2026-09-01）"),
+    reviewTo: z.string().describe("公開閱覽期間迄（同上格式）。期間有交集就算命中。"),
+    counties: z.array(z.string()).optional().describe("依機關名稱判定的縣市，例 ['臺中市','彰化縣']。可省略縣／市（'南投'），未給＝全國不篩。"),
+    category: z.enum(["工程類", "財物類", "勞務類"]).optional().describe("採購性質，由官網篩選（三類互斥、合計等於不限）。未給＝不限。"),
+    maxPages: z.number().optional().describe(`最多翻幾頁（每頁 ${TpReadCrawlerService.PAGE_SIZE} 筆），預設 10。`),
+  },
+  async ({ reviewFrom, reviewTo, counties, category, maxPages }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      const from = toROCNumber(reviewFrom);
+      const to = toROCNumber(reviewTo);
+      const badDates = [!from && `reviewFrom="${reviewFrom}"`, !to && `reviewTo="${reviewTo}"`].filter(Boolean);
+      if (badDates.length > 0) {
+        return reply(`日期格式無法解析：${badDates.join('、')}。請用 115/09/01 或 2026-09-01 這類格式。`);
+      }
+      if (from! > to!) {
+        return reply(`公開閱覽期間起 ${formatROCNumber(from!)} 晚於迄 ${formatROCNumber(to!)}，請對調。`);
+      }
+
+      let wanted: string[] | null = null;
+      if (counties?.length) {
+        const { groups, invalid } = resolveCounties(counties);
+        if (invalid.length > 0) {
+          const why = invalid.map(i => i.candidates.length ? `${i.input}（可能是 ${i.candidates.join('、')}）` : i.input).join('；');
+          return reply(`縣市名無法辨識：${why}。可用縣市：${listCounties().join('、')}`);
+        }
+        wanted = groups.map(g => g.county);
+      }
+
+      const { tenders, total, truncated } = await new TpReadCrawlerService().search({ reviewFrom: from!, reviewTo: to!, cate: category, maxPages });
+
+      // 同一案的更正閱覽公告（公告次數 02 以上）會多出一列，留最新一次
+      const latest = new Map<string, typeof tenders[number]>();
+      for (const t of tenders) {
+        const k = `${t.orgName}|${t.caseId}`;
+        const prev = latest.get(k);
+        if (!prev || t.noticeTimes.localeCompare(prev.noticeTimes) > 0) latest.set(k, t);
+      }
+      const merged = tenders.length - latest.size;
+
+      const rows = [...latest.values()].map(t => ({ ...t, county: countyInOrgName(t.orgName) }));
+      const unknown = rows.filter(r => !r.county).length;
+      const results = wanted ? rows.filter(r => r.county && wanted!.includes(r.county)) : rows;
+
+      const scope = [
+        `公開閱覽期間 ${formatROCNumber(from!)} ~ ${formatROCNumber(to!)}（期間有交集就算）`,
+        `採購性質 ${category ?? '不限'}${category ? '（官網篩選）' : ''}`,
+        wanted ? `縣市 ${wanted.join('、')}（依機關名稱）` : '全國不篩縣市',
+      ].join('｜');
+
+      let out = `### 公開閱覽查詢結果（共 ${results.length} 筆）\n\n> 範圍：${scope}\n\n`;
+      out += `官網總筆數 ${total} 筆，實際抓取 ${tenders.length} 筆`;
+      if (merged > 0) out += `，更正閱覽公告合併 ${merged} 筆`;
+      out += `，去重後 ${rows.length} 筆`;
+      if (wanted) out += `，套用縣市後 ${results.length} 筆`;
+      out += `。其中機關名稱判不出縣市的有 ${unknown} 筆${wanted ? '（已排除）' : ''}。\n\n`;
+
+      if (truncated) out += `> **註：已達 maxPages 上限、還沒抓完（官網 ${total} 筆、只抓到 ${tenders.length} 筆）。請調高 maxPages 或縮短期間。**\n\n`;
+
+      if (results.length === 0) {
+        out += `套用條件後 **0 筆**。\n\n> 公開閱覽是招標前的文件閱覽公告，本來就比招標公告少很多${category ? `，${category}又只占其中一部分` : ''}；這段期間沒有不代表沒有招標案，要查能投標的案子請用 search_tenders。\n`;
+        return reply(out);
+      }
+
+      out += `| 機關 | 縣市 | 案號 | 標案名稱 | 公開閱覽期間 | 公告次數 | 連結 |\n`;
+      out += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
+      results.forEach(r => {
+        const title = r.name.length > 35 ? r.name.slice(0, 33) + '...' : r.name;
+        out += `| ${r.orgName} | ${r.county ?? '（判不出）'} | **${r.caseId}** | ${title} | ${r.period} | ${r.noticeTimes} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
+      });
+
+      out += `\n> 縣市是用「機關名稱」判的，不是履約地點：中央機關／國營事業（台電、中油、鐵道局…）名稱裡沒縣市的一律歸不出來，該縣市機關在外縣市的案子則會被留下。\n`;
+      out += `> 「查看」是**公開閱覽公告**內頁（showTpReadDetail），和標案內頁不同編號空間，**不要餵給 get_tender_detail**。\n`;
+      out += `> 這些案子還在公開閱覽、**尚未招標也不能投標**；等它正式公告後才會出現在 search_tenders。\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`公開閱覽查詢失敗: ${error.message}`);
     }
   }
 );
