@@ -78,6 +78,7 @@ export class TenderService {
       type: `${t.tenderWay} (${t.tenderType})`,
       caseId: t.id,
       title: t.name,
+      orgName: t.orgName,
       budget: (t.budget ?? 0) > 0 ? t.budget!.toLocaleString() : "未提供或需登入",
       link: t.link,
       viewLink: t.link,

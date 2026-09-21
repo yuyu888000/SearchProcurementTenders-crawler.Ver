@@ -49,8 +49,8 @@ export interface TenderDetail {
   url: string;
   /** 是否成功取得內容（false 代表被驗證碼擋或版型不符） */
   ok: boolean;
-  /** 失敗原因：captcha=流量控制驗證碼、parse=版型不符、error=連線錯誤 */
-  reason?: 'captcha' | 'parse' | 'error';
+  /** 失敗原因：captcha=流量控制驗證碼、parse=版型不符、error=連線錯誤、award=決標類公告連結（請改用 get_award_detail） */
+  reason?: 'captcha' | 'parse' | 'error' | 'award';
   /** 錯誤訊息（reason=error 時） */
   message?: string;
   /** 欄位表（label -> value） */
@@ -78,8 +78,12 @@ export type TenderStatusType = '招標' | '決標' | '公開閱覽及公開徵�
 export interface ArchiveTender {
   /** 去重用的鍵（優先用內頁連結） */
   key: string;
-  /** 種類：招標公告 / 決標公告 / 無法決標公告 / 更正公告… */
+  /** 種類（已修正）：招標公告 / 決標公告 / 無法決標公告 / 更正公告… */
   kind: string;
+  /** 官網「種類」欄原文——它把無法決標也寫成「決標公告」，僅供對照 */
+  siteKind: string;
+  /** 是否為無法決標公告（依連結 nonAtm 或「(無法決標)」後綴判定） */
+  isNonAward: boolean;
   /** 機關名稱 */
   orgName: string;
   /** 標案案號 */

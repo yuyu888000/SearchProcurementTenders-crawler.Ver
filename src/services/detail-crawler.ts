@@ -80,6 +80,19 @@ export function extractPk(input: string): string | null {
   return null;
 }
 
+/**
+ * 決標／無法決標公告的 pk 是 pkAtmMain，與招標內頁的 pkPmsMain 是不同編號空間。
+ * 餵進 searchTenderDetail 不會報錯，而是回傳「剛好同號的另一個招標案」——靜默的錯答案，
+ * 所以這裡先攔下來，指向 get_award_detail。純 pk 無路徑可判，只能依既有行為當招標 pk。
+ */
+export function detectAwardLink(input: string): 'award' | 'nonAward' | null {
+  const s = input.trim();
+  if (/\/common\/nonAtm\?|QueryAtmNonAwardDetail/i.test(s)) return 'nonAward';
+  if (/\/common\/atm\?|QueryAtmAwardDetail/i.test(s)) return 'award';
+  if (/[?&]pkAtmMain=/i.test(s)) return 'award';
+  return null;
+}
+
 function isCaptchaPage(html: string): boolean {
   return html.includes('撲克牌') || (html.includes('A區') && html.includes('B區') && html.includes('重新整理'));
 }
@@ -133,6 +146,16 @@ export async function fetchTenderDetails(inputs: string[]): Promise<{ details: T
   let dirty = false;
 
   for (const input of inputs) {
+    const awardKind = detectAwardLink(input);
+    if (awardKind) {
+      const label = awardKind === 'award' ? '決標公告' : '無法決標公告';
+      details.push({
+        input, pk: '', url: input.trim(), ok: false, reason: 'award',
+        message: `這是${label}的連結，它的 pk 與招標內頁不同編號空間，餵進來會取回別的案子。請改用 get_award_detail 查這一筆（可取得得標廠商、投標家數、落標廠商）。`,
+        fields: {}, cached: false,
+      });
+      continue;
+    }
     const pk = extractPk(input);
     if (!pk) {
       details.push({ input, pk: '', url: '', ok: false, reason: 'parse', message: '無法從輸入取出標案識別碼（pk）', fields: {}, cached: false });

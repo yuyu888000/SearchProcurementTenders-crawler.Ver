@@ -28,6 +28,7 @@ console.log('註冊的工具：');
 for (const t of tools) {
   console.log(`  - ${t.name}  參數: ${Object.keys(t.inputSchema?.properties ?? {}).join(', ')}`);
 }
-const has = tools.some(t => t.name === 'get_tender_detail');
-console.log(has ? '\nPASS  get_tender_detail 已註冊' : '\nFAIL  找不到 get_tender_detail');
-process.exit(has ? 0 : 1);
+const expected = ['search_tenders', 'get_tender_detail', 'search_tender_archive', 'search_awards', 'get_award_detail', 'find_awards_by_vendor', 'resolve_award_vendors'];
+const missing = expected.filter(n => !tools.some(t => t.name === n));
+for (const n of expected) console.log(missing.includes(n) ? `FAIL  找不到 ${n}` : `PASS  ${n} 已註冊`);
+process.exit(missing.length === 0 ? 0 : 1);

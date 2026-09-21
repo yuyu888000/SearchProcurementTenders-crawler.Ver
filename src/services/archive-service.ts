@@ -41,6 +41,8 @@ export function parseYears(input?: string): { years: number[]; invalid: string[]
 
 export interface ArchiveResult {
   kind: string;
+  /** 是否為無法決標公告（官網「種類」欄會誤寫成決標公告） */
+  isNonAward: boolean;
   orgName: string;
   caseId: string;
   title: string;
@@ -110,12 +112,15 @@ function matchesDateFilter(t: ArchiveTender, f: DateFilter): boolean {
 
 function toResult(t: ArchiveTender): ArchiveResult {
   const deadline = parseROCDate(t.endDate);
-  const status = deadline ? getRemainingDays(deadline) : (t.awardDate ? '已決標' : '-');
+  const status = deadline ? getRemainingDays(deadline)
+    : t.isNonAward ? '無法決標'
+    : (t.awardDate ? '已決標' : '-');
   // 決標／無法決標公告本身就是結案紀錄；沒有截止日可判時，看有沒有決標日
   const closed = t.kind.includes('決標') || (deadline ? deadline.getTime() < Date.now() : Boolean(t.awardDate));
 
   return {
     kind: t.kind,
+    isNonAward: t.isNonAward,
     orgName: t.orgName,
     caseId: t.caseId,
     title: t.name,

@@ -96,9 +96,20 @@ export class BulletionCrawlerService {
       const href = $(el).find('a[href*="pk="]').first().attr('href') ?? '';
       const link = href ? new URL(href, 'https://web.pcc.gov.tw').toString() : '';
 
+      // 官網「種類」欄把無法決標公告也寫成「決標公告」；真正的區別在連結路徑
+      // （atm＝決標、nonAtm＝無法決標）與「決標或無法決標公告」欄的 (無法決標) 後綴。
+      const awardCol = cell(5);
+      const isNonAward = /nonAtm\?/i.test(link) || /無法決標/.test(awardCol);
+      const siteKind = cell(1);
+      const kind = isNonAward ? '無法決標公告'
+        : /\/common\/atm\?/i.test(link) ? '決標公告'
+        : siteKind;
+
       out.push({
         key: link || `${caseId}#${idx}#${year}`,
-        kind: cell(1),
+        kind,
+        siteKind,
+        isNonAward,
         orgName: cell(2),
         caseId,
         name,
