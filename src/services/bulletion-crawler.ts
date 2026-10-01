@@ -116,6 +116,7 @@ export class BulletionCrawlerService {
         publishDate: cell(4),
         awardDate: cell(5),
         endDate: cell(6),
+        readPeriod: cell(7),
         year,
         link,
       });
