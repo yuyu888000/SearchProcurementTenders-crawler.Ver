@@ -6,6 +6,8 @@ import {
   AwardBidder, AwardDetailBatch, AwardDetailInput, AwardDetailKind, AwardDetailRecord,
   AwardDetailResult, NonAwardDetailRecord,
 } from '../types/award.js';
+import { lookupAwardDate } from './award-pk-index.js';
+import { fetchDayIndex, fetchCaseDetail, filingNumberFromPk, DayIndexResult } from './mirror-client.js';
 
 /**
  * 決標公告／無法決標公告內頁（得標廠商唯一的完整來源，清單沒有廠商欄）。
@@ -15,6 +17,11 @@ import {
  * 連線錯誤也佔額度）、單次呼叫也最多 5 次、序列＋間隔 3 秒、一遇驗證碼就停整批並在冷卻期內拒絕再連線。
  * 額度與冷卻起點寫在 .cache/award-rate.json，Claude Desktop 與 Claude Code 兩個行程合計仍是同一份額度。
  * 絕不重試、絕不繞過驗證碼。
+ *
+ * 2026-09-23 起先走 g0v 鏡像：官方 pk base64 解開就是公告收文編號，而鏡像 listbydate 的 filename
+ * 尾號正是同一組數字，所以只要知道這個 pk 的決標公告日（search_awards 查過就會記在 award-pk-dates.json），
+ * 就能用「一天一請求」定位到案件，再用 /api/tender 取回與官方內頁同樣的欄位，完全不動用官方額度。
+ * 鏡像沒有、解析不出、或查不到日期的，照原本的官方內頁流程走，額度控管一字未動。
  */
 
 const SITE_ORIGIN = 'https://web.pcc.gov.tw';
@@ -568,7 +575,42 @@ function rejectReason(page: AwardPageOk, kind: AwardDetailKind, assumedKind: boo
   return '';
 }
 
-export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: string } = {}): Promise<AwardDetailBatch> {
+/**
+ * 用 pk 走鏡像取單案明細：pk → 收文編號 → （查得到決標公告日才行）當天日索引 → 案件位址 → /api/tender。
+ * 任何一步缺料就回空，呼叫端照原本的官方內頁流程走。
+ */
+async function tryMirror(
+  kind: AwardDetailKind,
+  pk: string,
+  dayCache: Map<number, DayIndexResult>,
+): Promise<{ record?: AwardDetailRecord | NonAwardDetailRecord; pairs?: [string, string][]; requests: number }> {
+  let requests = 0;
+  const filing = filingNumberFromPk(pk);
+  if (!filing) return { requests };
+
+  const date = await lookupAwardDate(pk);
+  // 這個 pk 沒被 search_awards 查過就不知道是哪一天，鏡像是按日出貨的，沒日期就走不了
+  if (date == null) return { requests };
+
+  let day = dayCache.get(date);
+  if (!day) {
+    day = await fetchDayIndex(date);
+    requests += day.requests;
+    dayCache.set(date, day);
+  }
+  const ref = day.byFiling.get(filing);
+  if (!ref) return { requests };
+
+  const detail = await fetchCaseDetail(ref, filing, kind);
+  requests += detail.requests;
+  if (!detail.record || !detail.pairs) return { requests };
+  return { record: detail.record, pairs: detail.pairs, requests };
+}
+
+export async function fetchAwardDetails(
+  inputs: string[],
+  opts: { cacheFile?: string; mirror?: boolean; mirrorOnly?: boolean } = {},
+): Promise<AwardDetailBatch> {
   if (inputs.length > MAX_AWARD_CASES) {
     throw new Error(`一次最多 ${MAX_AWARD_CASES} 筆，本次給了 ${inputs.length} 筆，請分批`);
   }
@@ -584,6 +626,13 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
   let duplicates = 0;
   let blocked = false;
   let cooldown = false;
+  let fromMirror = 0;
+  let mirrorRequests = 0;
+  // 同一批常常是同一天的案子，日索引抓一次就好
+  const dayCache = new Map<number, DayIndexResult>();
+  const useMirror = opts.mirror ?? true;
+  // 批次補欄位的情境：鏡像拿不到就算了，不要回頭去燒官方那 5 次/10 分鐘的額度
+  const mirrorOnly = Boolean(opts.mirrorOnly);
 
   for (const input of inputs) {
     const n = normalizeAwardInput(input);
@@ -608,6 +657,24 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
     if (hit) {
       cachedCount++;
       results.push({ ...base, ok: true, cached: true, record: hit.record, pairs: hit.pairs, savedAt: hit.savedAt });
+      continue;
+    }
+
+    // 鏡像優先：成功就不必動用官方那 10 分鐘 5 次的額度
+    if (useMirror && !blocked) {
+      const m = await tryMirror(kind, pk, dayCache);
+      mirrorRequests += m.requests;
+      if (m.record && m.pairs) {
+        fromMirror++;
+        store[key] = { kind, pk, url, record: m.record, pairs: m.pairs, savedAt: new Date().toISOString() };
+        await saveCache(file, store);
+        results.push({ ...base, ok: true, cached: false, fromMirror: true, record: m.record, pairs: m.pairs });
+        continue;
+      }
+    }
+
+    if (mirrorOnly) {
+      results.push({ ...base, ok: false, cached: false, failure: 'error', message: '鏡像沒有這筆，mirrorOnly 模式不開官方內頁' });
       continue;
     }
 
@@ -657,7 +724,7 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
     results.push(r);
   }
 
-  return { results, fetched, cachedCount, blocked, cooldown, overLimit, duplicates };
+  return { results, fetched, cachedCount, blocked, cooldown, overLimit, duplicates, fromMirror, mirrorRequests };
 }
 
 function cooldownMessage(): string {
@@ -766,8 +833,11 @@ export function renderAwardDetails(batch: AwardDetailBatch, opts: { full?: boole
   const okCached = unique.filter(x => x.r.ok && x.r.cached).length;
 
   out += `---\n\n#### 摘要\n\n`;
-  out += `- 本次實抓 ${okFetched} 筆、快取 ${okCached} 筆、未取得 ${failed.length} 筆（本次連線內頁 ${batch.fetched} 次）`;
+  const okMirror = unique.filter(x => x.r.ok && x.r.fromMirror).length;
+  out += `- 本次實抓 ${okFetched} 筆（鏡像 ${okMirror} 筆、官方內頁 ${okFetched - okMirror} 筆）、快取 ${okCached} 筆、未取得 ${failed.length} 筆`;
+  out += `（官方內頁連線 ${batch.fetched} 次、鏡像 ${batch.mirrorRequests} 次）`;
   out += dupCount ? `；重複輸入 ${dupCount} 筆已合併\n` : '\n';
+  if (okMirror) out += `- 其中 ${okMirror} 筆取自 g0v 鏡像 pcc-api.openfun.app（資料同源於採購網），不佔官方額度；限非商業用途\n`;
   if (fullOmitted) out += `- full=true：全部欄位只列前 ${FULL_FIELDS_MAX_CASES} 筆，其餘 ${fullOmitted} 筆只給精選表\n`;
   if (failed.length) {
     out += `- 未取得：\n`;
@@ -784,4 +854,86 @@ export function renderAwardDetails(batch: AwardDetailBatch, opts: { full?: boole
     out += `\n> 政府採購網已對本次連線啟動流量控制（內頁約連抓 5~8 筆就會跳撲克牌驗證碼，鎖 20 分鐘以上）。這是網站的防自動化機制，不是違規紀錄。請稍後再試，或在瀏覽器開啟上列連結（會要求點選撲克牌驗證）。**不要重複重試**，被鎖期間再連線只會延長封鎖。\n`;
   }
   return out;
+}
+
+// ---------- 人工存檔的 HTML ----------
+
+/**
+ * 取得決標公告的第三條路：人工另存的網頁。
+ *
+ * 為什麼需要：鏡像沒收錄、官方內頁又被驗證碼鎖住時，這是唯一出路。
+ * 2026-09-23 實測 53 筆鏡像查無的案子，由使用者逐一開啟官方內頁另存 HTML，
+ * 用同一支 parseAwardDetailHtml 解析，53/53 全數成功且欄位與官方一致。
+ *
+ * 解析結果寫進與線上抓取同一份快取，之後 get_award_detail 查同一案就直接命中，
+ * 不必再開網頁、也不佔額度。
+ */
+export interface ParsedHtmlFile {
+  file: string;
+  ok: boolean;
+  pk?: string;
+  kind?: AwardDetailKind;
+  record?: AwardDetailRecord | NonAwardDetailRecord;
+  cached?: boolean;
+  message?: string;
+}
+
+/** 存檔頁面裡帶著原始網址，pk 從那裡取；抓不到就沒辦法入快取 */
+function pkFromHtml(html: string): { pk: string; kind: AwardDetailKind } | null {
+  const m = html.match(/QueryAtm(Non)?AwardDetail\?pkAtmMain=([A-Za-z0-9%+/=]+)/);
+  if (m) return { pk: safeDecode(m[2]), kind: m[1] ? 'nonAward' : 'award' };
+  const m2 = html.match(/[?&]pkAtmMain=([A-Za-z0-9%+/=]+)/);
+  if (m2) return { pk: safeDecode(m2[1]), kind: 'award' };
+  return null;
+}
+
+/**
+ * 解析一批本機 HTML 檔並寫入快取。
+ * files 已經是展開後的檔案路徑清單（呼叫端負責處理資料夾）。
+ */
+export async function ingestAwardHtmlFiles(
+  files: { path: string; html: string }[],
+  opts: { cacheFile?: string } = {},
+): Promise<{ results: ParsedHtmlFile[]; added: number; updated: number }> {
+  const file = opts.cacheFile ?? AWARD_DETAIL_CACHE_FILE;
+  const store = await loadCache(file);
+  const results: ParsedHtmlFile[] = [];
+  let added = 0, updated = 0;
+
+  for (const f of files) {
+    const found = pkFromHtml(f.html);
+    const page = parseAwardDetailHtml(f.html, found?.kind ?? null);
+
+    if (page.type === 'blocked') {
+      results.push({ file: f.path, ok: false, message: `這頁是驗證碼／封鎖頁，不是公告內容（${page.message}）——請重新開啟並通過驗證後再存` });
+      continue;
+    }
+    if (page.type === 'parse') {
+      results.push({ file: f.path, ok: false, message: `解析不出公告內容：${page.message}` });
+      continue;
+    }
+    if (!found) {
+      results.push({ file: f.path, ok: false, kind: page.type, record: page.record, message: '頁面裡找不到 pkAtmMain，無法對應案件編號，未寫入快取（請用「網頁，僅 HTML」另存原始頁面，不要用列印或轉存 PDF 再轉回來）' });
+      continue;
+    }
+
+    // 與線上抓取同一套把關：解析不可信的不入快取
+    const reject = rejectReason(page, found.kind, false);
+    if (reject) {
+      results.push({ file: f.path, ok: false, pk: found.pk, kind: page.type, message: reject });
+      continue;
+    }
+
+    const key = `${found.kind}:${found.pk}`;
+    const existed = Boolean(validEntry(store[key]));
+    store[key] = {
+      kind: found.kind, pk: found.pk, url: awardDetailUrl(found.kind, found.pk),
+      record: page.record, pairs: page.pairs, savedAt: new Date().toISOString(),
+    };
+    existed ? updated++ : added++;
+    results.push({ file: f.path, ok: true, pk: found.pk, kind: page.type, record: page.record, cached: existed });
+  }
+
+  if (added || updated) await saveCache(file, store);
+  return { results, added, updated };
 }

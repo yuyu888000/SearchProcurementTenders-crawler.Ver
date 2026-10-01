@@ -183,6 +183,8 @@ export interface AwardDetailResult {
   savedAt?: string;
   /** 同一呼叫中重複輸入同一案時，指向第一次出現的 results 索引 */
   duplicateOf?: number;
+  /** 這筆是從 g0v 鏡像取得的（沒有動用官方內頁額度） */
+  fromMirror?: boolean;
 }
 
 export interface AwardDetailBatch {
@@ -197,4 +199,8 @@ export interface AwardDetailBatch {
   overLimit: number;
   /** 同一呼叫中重複輸入、已合併的筆數 */
   duplicates: number;
+  /** 本次由 g0v 鏡像解決、沒動用官方額度的案數 */
+  fromMirror: number;
+  /** 對鏡像送出的請求數 */
+  mirrorRequests: number;
 }

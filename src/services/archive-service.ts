@@ -49,6 +49,8 @@ export interface ArchiveResult {
   publishDate: string;
   deadline: string;
   awardDate: string;
+  /** 公開閱覽／公開徵求期間原文（起 ~ 訖），其他種類為空 */
+  readPeriod: string;
   /** 「已截止」/「今日截止」/「N 天」——用來分等標期內與非等標期內 */
   status: string;
   /** 截止日已過（或已決標）＝非等標期內 */
@@ -106,12 +108,21 @@ function matchesDateFilter(t: ArchiveTender, f: DateFilter): boolean {
     return true;
   };
 
-  return inRange(t.publishDate, f.publishFrom, f.publishTo)
+  // 公開閱覽／徵求沒有招標公告日，公告日區間改套閱覽起日
+  return inRange(t.publishDate || readRange(t.readPeriod)[0], f.publishFrom, f.publishTo)
     && inRange(t.endDate, f.deadlineFrom, f.deadlineTo);
 }
 
+/** 「115/09/24 ~ 115/10/02」→ ["115/09/24", "115/10/02"]；不是區間就回空字串 */
+function readRange(period: string): [string, string] {
+  const m = period?.match(/(\d{2,3}\/\d{1,2}\/\d{1,2})\s*[~～]\s*(\d{2,3}\/\d{1,2}\/\d{1,2})/);
+  return m ? [m[1], m[2]] : ["", ""];
+}
+
 function toResult(t: ArchiveTender): ArchiveResult {
-  const deadline = parseROCDate(t.endDate);
+  // 公開閱覽／徵求沒有截止投標日，用閱覽訖日當天結束判斷是否已截止
+  const readTo = readRange(t.readPeriod)[1];
+  const deadline = parseROCDate(t.endDate) ?? (readTo ? parseROCDate(`${readTo} 23:59`) : null);
   const status = deadline ? getRemainingDays(deadline)
     : t.isNonAward ? '無法決標'
     : (t.awardDate ? '已決標' : '-');
@@ -127,6 +138,7 @@ function toResult(t: ArchiveTender): ArchiveResult {
     publishDate: t.publishDate,
     deadline: t.endDate,
     awardDate: t.awardDate,
+    readPeriod: t.readPeriod,
     status,
     closed,
     year: t.year,

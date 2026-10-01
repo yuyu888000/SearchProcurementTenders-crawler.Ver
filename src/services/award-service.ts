@@ -9,6 +9,7 @@ import {
 } from '../types/award.js';
 import { rocStringToNumber } from '../utils/date.js';
 import { locationLabel } from './award-locations.js';
+import { rememberAwardDates } from './award-pk-index.js';
 
 /**
  * 決標查詢（決標公告清單）readTenderAgent。
@@ -228,9 +229,11 @@ export async function queryAwards(q: AwardQuery, opts: { maxRows?: number } = {}
   const params = buildParams(q);
   const startCount = requestCounter;
   const tag = (r: Omit<AwardRow, 'execLocation'>): AwardRow => ({ ...r, execLocation: q.execLocation ?? '' });
-  const done = (siteTotal: number, rows: AwardRow[], extra: Partial<AwardQueryResult> = {}): AwardQueryResult => ({
-    siteTotal, rows, truncated: false, requests: requestCounter - startCount, ...extra,
-  });
+  const done = (siteTotal: number, rows: AwardRow[], extra: Partial<AwardQueryResult> = {}): AwardQueryResult => {
+    // 順手記下 pk → 決標公告日，get_award_detail 才走得了鏡像那條快路（純加速快取，失敗不影響本次結果）
+    rememberAwardDates(rows);
+    return { siteTotal, rows, truncated: false, requests: requestCounter - startCount, ...extra };
+  };
 
   let rows: AwardRow[] = [];
   let siteTotal = 0;

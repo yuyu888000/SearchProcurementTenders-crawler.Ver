@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fetchAndFilterTenders } from "./services/tender-service.js";
-import { fetchTenderDetails, KEY_FIELDS, MAX_FETCH_PER_CALL } from "./services/detail-crawler.js";
+import { fetchTenderDetails, KEY_FIELDS, MAX_FETCH_PER_CALL, TENDER_WINDOW_MAX, TENDER_WINDOW_MS, TENDER_COOLDOWN_MS } from "./services/detail-crawler.js";
 import { toROCNumber, formatROCNumber, daysBetweenROC } from "./utils/date.js";
 import { resolveCodes } from "./services/cpc-catalog.js";
 import { searchByCategories } from "./services/proctrg-service.js";
@@ -17,12 +17,15 @@ import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/a
 import { ExecLocationOption } from "./types/award.js";
 import {
   fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
-  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES,
+  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES, ingestAwardHtmlFiles, normalizeAwardInput,
 } from "./services/award-detail-crawler.js";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { join as joinPath, basename } from "node:path";
 import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache, setJobPriority, JobPriority,
 } from "./services/resolve-service.js";
 import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
+import { fillCategoriesInWorkbook, recheckPendingCategories, DEFAULT_MIRROR_PER_CALL } from "./services/award-category.js";
 import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
 import { extractPk } from "./services/detail-crawler.js";
 import { hasGroqKey, NO_KEY_MESSAGE } from "./services/groq-client.js";
@@ -161,7 +164,7 @@ server.tool(
 
 server.tool(
   "get_tender_detail",
-  `Fetch the DETAIL page of specific tenders from web.pcc.gov.tw, given the links returned by search_tenders (or raw pk values). Returns fields that the search listing does NOT contain: 標的分類 (category code, e.g. 5177 室內裝潢工程 / 5179 其他裝修工程), 廠商資格摘要 (vendor qualification), 截止投標 with time-of-day, 決標方式, 押標金, 履約地點/期限, and agency contact info. Use this to judge whether a tender really is the type of work the user wants — the category code is far more reliable than keyword matching on the tender name. IMPORTANT: the site rate-limits detail pages; at most ${MAX_FETCH_PER_CALL} uncached tenders per call, results are cached locally so re-querying the same tender is free. If the site returns its CAPTCHA page the remaining items are reported as not-retrieved with their links — do NOT retry in a loop, tell the user to open those links manually. SCOPE: this tool is for TENDER notices (招標公告) only. Award-notice links — 決標公告 (…/common/atm?pk=), 無法決標公告 (…/common/nonAtm?pk=), or any URL carrying pkAtmMain=, which is what search_awards and search_tender_archive return for awards — live in a DIFFERENT key space and are now rejected WITHOUT a request; use get_award_detail for those. (Before this guard, feeding an award pk here silently returned a DIFFERENT tender that happened to share the number.)`,
+  `Fetch the DETAIL page of specific tenders from web.pcc.gov.tw, given the links returned by search_tenders (or raw pk values). Returns fields that the search listing does NOT contain: 標的分類 (category code, e.g. 5177 室內裝潢工程 / 5179 其他裝修工程), 廠商資格摘要 (vendor qualification), 截止投標 with time-of-day, 決標方式, 押標金, 履約地點/期限, and agency contact info. Use this to judge whether a tender really is the type of work the user wants — the category code is far more reliable than keyword matching on the tender name. IMPORTANT — RATE LIMITS (tell the user whenever they affect the answer): the site CAPTCHA-locks detail pages when hit too fast, and this endpoint is currently the ONLY working detail page (決標公告內頁 has been locked since 2026-09-14). Three guards: at most ${MAX_FETCH_PER_CALL} uncached tenders per call (≥1.5 s apart); at most ${TENDER_WINDOW_MAX} detail requests in ANY rolling ${TENDER_WINDOW_MS / 60000} minutes, shared across calls; and after a CAPTCHA the whole tool cools down for ${TENDER_COOLDOWN_MS / 60000} minutes. Results are cached locally, so re-querying the same tender is free and uses no quota. Measured 2026-09-22: 15 s spacing sustained 17 consecutive fetches without a block — that is where the rolling quota comes from. For BULK backfill (dozens+ of tenders) write a standalone throttled script instead of looping this tool; items over quota are reported as not-retrieved with the earliest time to retry — do NOT retry in a loop, and never try to bypass the CAPTCHA. SCOPE: this tool is for TENDER notices (招標公告) only. Award-notice links — 決標公告 (…/common/atm?pk=), 無法決標公告 (…/common/nonAtm?pk=), or any URL carrying pkAtmMain=, which is what search_awards and search_tender_archive return for awards — live in a DIFFERENT key space and are now rejected WITHOUT a request; use get_award_detail for those. (Before this guard, feeding an award pk here silently returned a DIFFERENT tender that happened to share the number.)`,
   {
     cases: z.array(z.string()).min(1).describe("標案內頁連結（search_tenders 回傳的「查看」網址）或 pk 值，一次最多建議 8 筆"),
     full: z.boolean().optional().describe("true 則回傳內頁全部欄位（約 70 項），預設只回精選欄位"),
@@ -236,7 +239,7 @@ server.tool(
 
 server.tool(
   "search_tender_archive",
-  `Search the FULL-TEXT bulletin archive (電子公報全文檢索) of web.pcc.gov.tw. This is the ONLY way to find tenders whose bidding period has already CLOSED — search_tenders covers ONLY tenders still open for bidding (等標期內). Covers ROC years ${MIN_ROC_YEAR} to ${currentROCYear()}; the site accepts one year per request, so this tool queries at most ${MAX_YEARS_PER_CALL} years per call. Returns 種類 (招標公告 / 決標公告 / 無法決標公告), 機關名稱, 標案案號, 標案名稱, and BOTH dates the bulletin carries: 招標公告日 and 決標/無法決標公告日, plus 截止投標日期 and a detail link. TWO CORRECTNESS NOTES: (a) the site's own 種類 column labels 無法決標公告 as 決標公告 — this tool re-derives it from the link type (atm vs nonAtm) and the "(無法決標)" suffix, so trust the 種類 column here, not the site's; (b) this tool's publishFrom/publishTo filter and the bulletin's sort key are the 招標公告日, NOT the award date — for "which cases were awarded in period X" use search_awards instead, which filters server-side on 決標公告日. Feed 招標公告 links to get_tender_detail and 決標/無法決標公告 links to get_award_detail (different key spaces). Results are split into 等標期內 (still open) and 已截止／歷史 (closed) sections. Each year returns at most the 100 most recent matches (the site caps one response at 100 rows and its pagination needs a real browser session), and the output states the site-wide hit count whenever it is larger — narrow with a 標案案號, a tighter keyword, or one year per call instead of expecting more rows. Unless the user explicitly asked only for tenders they can still bid on, run this tool ALONGSIDE search_tenders and report both sections with their counts — write "0 筆" explicitly for an empty section instead of omitting it. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  `Search the FULL-TEXT bulletin archive (電子公報全文檢索) of web.pcc.gov.tw. This is the ONLY way to find tenders whose bidding period has already CLOSED — search_tenders covers ONLY tenders still open for bidding (等標期內). Covers ROC years ${MIN_ROC_YEAR} to ${currentROCYear()}; the site accepts one year per request, so this tool queries at most ${MAX_YEARS_PER_CALL} years per call. Returns 種類 (招標公告 / 決標公告 / 無法決標公告), 機關名稱, 標案案號, 標案名稱, and BOTH dates the bulletin carries: 招標公告日 and 決標/無法決標公告日, plus 截止投標日期 and a detail link. TWO CORRECTNESS NOTES: (a) the site's own 種類 column labels 無法決標公告 as 決標公告 — this tool re-derives it from the link type (atm vs nonAtm) and the "(無法決標)" suffix, so trust the 種類 column here, not the site's; (b) this tool's publishFrom/publishTo filter and the bulletin's sort key are the 招標公告日, NOT the award date — for "which cases were awarded in period X" use search_awards instead, which filters server-side on 決標公告日; (c) 公開閱覽／公開徵求 rows have no 招標公告日 — for them publishFrom/publishTo apply to the 公開閱覽/徵求 start date and open/closed is judged by its end date (shown in the 公開閱覽/徵求期間 column). Feed 招標公告 links to get_tender_detail and 決標/無法決標公告 links to get_award_detail (different key spaces). Results are split into 等標期內 (still open) and 已截止／歷史 (closed) sections. Each year returns at most the 100 most recent matches (the site caps one response at 100 rows and its pagination needs a real browser session), and the output states the site-wide hit count whenever it is larger — narrow with a 標案案號, a tighter keyword, or one year per call instead of expecting more rows. Unless the user explicitly asked only for tenders they can still bid on, run this tool ALONGSIDE search_tenders and report both sections with their counts — write "0 筆" explicitly for an empty section instead of omitting it. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
   {
     keyword: z.string().min(1).describe("全文查詢字串。支援布林語法：AND（或 , &）、OR（或 ; |）、NOT（或 !）與括號；含保留字請用雙引號包住。也可直接放標案案號。"),
     years: z.string().optional().describe(`民國年度，官網一次只吃一年，本工具一次最多 ${MAX_YEARS_PER_CALL} 年。可寫 115、114,115、113-115。預設當年（${currentROCYear()}），範圍 ${MIN_ROC_YEAR}~${currentROCYear()}。`),
@@ -284,11 +287,11 @@ server.tool(
       const closed = results.filter(r => r.closed);
 
       const table = (rows: typeof results) => {
-        let t = `| 種類 | 機關 | 案號 | 標案名稱 | 招標公告日 | 決標/無法決標公告日 | 截止投標 | 狀態 | 連結 |\n`;
-        t += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
+        let t = `| 種類 | 機關 | 案號 | 標案名稱 | 招標公告日 | 決標/無法決標公告日 | 截止投標 | 公開閱覽/徵求期間 | 狀態 | 連結 |\n`;
+        t += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
         rows.forEach(r => {
           const title = r.title.length > 35 ? r.title.slice(0, 33) + '...' : r.title;
-          t += `| ${r.kind} | ${r.orgName} | **${r.caseId}** | ${title} | ${r.publishDate || '-'} | ${r.awardDate || '-'} | ${r.deadline || '-'} | ${r.status} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
+          t += `| ${r.kind} | ${r.orgName} | **${r.caseId}** | ${title} | ${r.publishDate || '-'} | ${r.awardDate || '-'} | ${r.deadline || '-'} | ${r.readPeriod || '-'} | ${r.status} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
         });
         return t;
       };
@@ -304,6 +307,7 @@ server.tool(
       }
       out += `> 「種類」已依連結型態修正：官網該欄把無法決標公告也寫成「決標公告」，本表以 atm／nonAtm 與「(無法決標)」後綴判定。\n`;
       out += `> 日期有兩欄：「招標公告日」是公報排序與本工具日期篩選的依據；「決標/無法決標公告日」是決標側的日期。**要依決標期間查案件請用 search_awards**，用本工具的日期條件會篩到招標公告日。\n`;
+      out += `> 公開閱覽／公開徵求沒有招標公告日：日期篩選改用閱覽起日，是否截止改用閱覽訖日判斷。\n`;
       out += `> 招標公告的「查看」連結可餵給 get_tender_detail；決標／無法決標公告的連結要餵 get_award_detail（兩者 pk 屬不同編號空間）。\n`;
 
       return { content: [{ type: "text", text: out }] };
@@ -585,14 +589,15 @@ server.tool(
 
 server.tool(
   "get_award_detail",
-  `Fetch the AWARD NOTICE detail page (決標公告內頁 QueryAtmAwardDetail, or 無法決標公告 QueryAtmNonAwardDetail) for cases given as the links in search_awards' table (or raw pk values). This is the ONLY complete source of winning vendors — the award listing has no vendor column. Per case it returns 得標廠商 with 統編, 投標廠商家數, 落標廠商, 預算金額, 總決標金額, 減標率 (1 − 總決標金額/預算金額), 決標方式, 決標日期, 決標公告日期, 履約地點（含地區）, 履約起迄, and a bidder table (序號/廠商名稱/統編/是否得標/中小企業/地址/決標金額); 無法決標 notices show the reason and dates. full=true appends every field on the page, but only for the first ${FULL_FIELDS_MAX_CASES} successful cases (the rest get the summary table only). LIMITS — tell the user whenever they affect the answer: (1) RATE LIMIT: the site CAPTCHA-locks detail pages after roughly 5~8 consecutive requests (the lock lasts 20+ minutes), so each call makes at most ${MAX_AWARD_FETCH_PER_CALL} detail-page requests, sequentially and ≥3 s apart, and this server makes at most ${DETAIL_WINDOW_MAX} detail-page requests in ANY rolling ${DETAIL_WINDOW_MS / 60000}-minute window, shared across all calls (including concurrent ones) and across MCP processes — 任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內最多 ${DETAIL_WINDOW_MAX} 次內頁請求（種類不符、解析失敗、連線錯誤也會佔額度）; cases whose parse can be trusted are cached locally, and re-querying them is free and does not use that quota. Cases beyond the quota are listed as not retrieved with the earliest time they can be fetched — query them in a LATER call after that time, do not loop. If the CAPTCHA page appears the whole batch stops immediately and this server refuses further detail requests for 20 minutes (cached cases still return): do NOT retry and never try to bypass the CAPTCHA; give the user the links to open manually. (2) 統編 may be MASKED (e.g. F1275*****, sole proprietors / individuals) — it is reported as-is, never guess the hidden digits. (3) 決標公告日期 ≠ 決標日期: the notice usually lags the award by 1~20 days. (4) Pass the FULL link: a bare pk carries no path to tell 決標 from 無法決標, so it is treated as a 決標公告. (5) Tender-notice links (tpam?pk= / searchTenderDetail?pkPmsMain=) are rejected — use get_tender_detail for 招標公告; conversely never feed 決標／無法決標 links to get_tender_detail (different pk key space, it returns a WRONG case). This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  `Fetch the AWARD NOTICE detail page (決標公告內頁 QueryAtmAwardDetail, or 無法決標公告 QueryAtmNonAwardDetail) for cases given as the links in search_awards' table (or raw pk values). This is the ONLY complete source of winning vendors — the award listing has no vendor column. FAST PATH (useMirror, default true): the official pk is the base64 of the notice's filing number, which is also the tail of the g0v mirror's filename, so when the case was previously seen in a search_awards listing (which records its 決標公告日) this tool takes the same fields from pcc-api.openfun.app — one day-index request plus one case request, NO official quota consumed and no CAPTCHA risk. Cases the mirror lacks, or whose 決標公告日 was never recorded, fall back to the official page described below; the summary states how many came from each source. The mirror is licensed for personal/research NON-COMMERCIAL use — set useMirror=false for commercial work. Per case it returns 得標廠商 with 統編, 投標廠商家數, 落標廠商, 預算金額, 總決標金額, 減標率 (1 − 總決標金額/預算金額), 決標方式, 決標日期, 決標公告日期, 履約地點（含地區）, 履約起迄, and a bidder table (序號/廠商名稱/統編/是否得標/中小企業/地址/決標金額); 無法決標 notices show the reason and dates. full=true appends every field on the page, but only for the first ${FULL_FIELDS_MAX_CASES} successful cases (the rest get the summary table only). LIMITS — tell the user whenever they affect the answer: (1) RATE LIMIT: the site CAPTCHA-locks detail pages after roughly 5~8 consecutive requests (the lock lasts 20+ minutes), so each call makes at most ${MAX_AWARD_FETCH_PER_CALL} detail-page requests, sequentially and ≥3 s apart, and this server makes at most ${DETAIL_WINDOW_MAX} detail-page requests in ANY rolling ${DETAIL_WINDOW_MS / 60000}-minute window, shared across all calls (including concurrent ones) and across MCP processes — 任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內最多 ${DETAIL_WINDOW_MAX} 次內頁請求（種類不符、解析失敗、連線錯誤也會佔額度）; cases whose parse can be trusted are cached locally, and re-querying them is free and does not use that quota. Cases beyond the quota are listed as not retrieved with the earliest time they can be fetched — query them in a LATER call after that time, do not loop. If the CAPTCHA page appears the whole batch stops immediately and this server refuses further detail requests for 20 minutes (cached cases still return): do NOT retry and never try to bypass the CAPTCHA; give the user the links to open manually. (2) 統編 may be MASKED (e.g. F1275*****, sole proprietors / individuals) — it is reported as-is, never guess the hidden digits. (3) 決標公告日期 ≠ 決標日期: the notice usually lags the award by 1~20 days. (4) Pass the FULL link: a bare pk carries no path to tell 決標 from 無法決標, so it is treated as a 決標公告. (5) Tender-notice links (tpam?pk= / searchTenderDetail?pkPmsMain=) are rejected — use get_tender_detail for 招標公告; conversely never feed 決標／無法決標 links to get_tender_detail (different pk key space, it returns a WRONG case). This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
   {
     cases: z.array(z.string()).min(1).max(MAX_AWARD_CASES).describe(`search_awards 表格裡的「決標公告／無法決標公告」連結，或 pk 值（純 pk 預設當決標公告），1~${MAX_AWARD_CASES} 筆；每次最多 ${MAX_AWARD_FETCH_PER_CALL} 次內頁請求，且任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內合計最多 ${DETAIL_WINDOW_MAX} 次內頁請求（跨呼叫與跨行程共用）`),
     full: z.boolean().optional().describe(`true 則另附內頁全部欄位（只列前 ${FULL_FIELDS_MAX_CASES} 筆成功案），預設 false 只回精選欄位與投標廠商表`),
+    useMirror: z.boolean().optional().describe("是否先試 g0v 鏡像（pcc-api.openfun.app），預設 true。走鏡像不佔官方內頁額度，但該案要先被 search_awards 查過（才知道決標公告日）。鏡像限非商業用途，商業利用請設 false"),
   },
-  async ({ cases, full }) => {
+  async ({ cases, full, useMirror }) => {
     try {
-      const batch = await fetchAwardDetails(cases);
+      const batch = await fetchAwardDetails(cases, { mirror: useMirror ?? true });
       return { content: [{ type: "text", text: renderAwardDetails(batch, { full: Boolean(full) }) }] };
     } catch (error: any) {
       return { content: [{ type: "text", text: `取得決標公告內頁失敗: ${error.message}` }] };
@@ -703,7 +708,7 @@ server.tool(
 
 server.tool(
   "resolve_award_vendors",
-  `Batch-resolve WINNING VENDORS for a whole set of awarded cases, working around the detail-page CAPTCHA rate limit. Runs as a BACKGROUND JOB with a persisted, resumable state file — start it, then poll with action="status"; it keeps going while this MCP server process lives (restarting Claude restarts the process, so re-run action="start" with the same jobId to resume). Strategy, alternating automatically: (1) FREE lookups — the same firm usually wins several cases, so every known vendor name/統編 is reverse-queried on the listing endpoint (no CAPTCHA limit), often resolving many cases per request; every vendor newly discovered from a detail page is queued for lookup too; (2) DIRECTORY lookups (directory param, default "local") — full legal names from the MOEA company registry (工程顧問/技術顧問/景觀/工程設計/環境工程/測量) plus the architect-office roster are reverse-queried one per request, firms registered in the cases' counties first; "local" scans only those (measured: 1,605 local firms resolved 110 of 221 leftover cases in ~55 min, while the other ~5,600 firms would add ~3 h for ~20-40 more), "all" continues nationwide, "off" skips; the directory is cached 7 days; 技師事務所 have no open roster so they still need detail pages; (3) RATE-LIMITED detail pages — whatever is left is opened one by one, largest 決標金額 first, honouring the shared ${DETAIL_WINDOW_MAX}-requests-per-${DETAIL_WINDOW_MS / 60000}-minutes budget, so the valuable cases land first and the job survives being interrupted. Measured on a real 341-case batch: detail pages alone would take ~14 h; with lookups most cases resolve in a fraction of that. action="start" takes either explicit cases (pk/links) or a query (from/to/category/counties) that it runs through the same search as search_awards. action="result" returns the table and writes CSV+JSON under .cache/exports/. NOTE: lookup-resolved rows give the vendor name (and 統編 when looked up by id) but NOT 投標家數/落標廠商/預算/減標率 — those only come from the detail page; the 資料來源 column says which is which.`,
+  `Batch-resolve WINNING VENDORS for a whole set of awarded cases, working around the detail-page CAPTCHA rate limit. Runs as a BACKGROUND JOB with a persisted, resumable state file — start it, then poll with action="status"; it keeps going while this MCP server process lives (restarting Claude restarts the process, so re-run action="start" with the same jobId to resume). Strategy, alternating automatically: (0) MIRROR day-scan (useMirror, default true) — the g0v mirror pcc-api.openfun.app returns a whole day's announcements in ONE request, with winning vendor, losing vendors and bidder count already parsed, so the job scans each distinct 決標公告日 once (days with the most unresolved cases first, ≥3 s apart, 429 backed off); measured on 164 工程 awards of 115/09/22, one request matched 151 (92%) on 機關名稱+標案案號 and every match yielded a winner. Unmatched cases (mostly 變更設計/後續擴充, whose 案號 carries a -1/-2 suffix the mirror files elsewhere) fall through to the steps below, and the vendor names the mirror found are queued for lookup so those leftovers usually resolve too. The mirror is licensed for personal/research NON-COMMERCIAL use — set useMirror=false for commercial work. (0.5) FULL DETAIL (fullDetail, default false) — once every case has been settled, each one is re-read through the mirror to add the fields that exist ONLY on the award notice, on neither the listing nor the mirror's day index: 標的分類 WITH its sub-code (e.g. <勞務類>8672工程服務 — the listing only ever says 勞務類, useless when the whole query was already filtered to one category), 底價金額, 減標率, 決標日期 (which is NOT 決標公告日), 履約地點（含地區）, 履約起迄. One mirror request per case (~3 s apart), so 564 cases take roughly 30 minutes; it is mirror-ONLY and never spends the official detail-page quota, so cases the mirror lacks are marked skipped instead of escalated. Resumable: cases already detailed are not re-fetched. (1) FREE lookups — the same firm usually wins several cases, so every known vendor name/統編 is reverse-queried on the listing endpoint (no CAPTCHA limit), often resolving many cases per request; every vendor newly discovered from a detail page is queued for lookup too; (2) DIRECTORY lookups (directory param, default "local") — full legal names from the MOEA company registry (工程顧問/技術顧問/景觀/工程設計/環境工程/測量) plus the architect-office roster are reverse-queried one per request, firms registered in the cases' counties first; "local" scans only those (measured: 1,605 local firms resolved 110 of 221 leftover cases in ~55 min, while the other ~5,600 firms would add ~3 h for ~20-40 more), "all" continues nationwide, "off" skips; the directory is cached 7 days; 技師事務所 have no open roster so they still need detail pages; (3) RATE-LIMITED detail pages — whatever is left is opened one by one, largest 決標金額 first, honouring the shared ${DETAIL_WINDOW_MAX}-requests-per-${DETAIL_WINDOW_MS / 60000}-minutes budget, so the valuable cases land first and the job survives being interrupted. Measured on a real 341-case batch: detail pages alone would take ~14 h; with lookups most cases resolve in a fraction of that. action="start" takes either explicit cases (pk/links) or a query (from/to/category/counties) that it runs through the same search as search_awards. action="result" returns the table and writes CSV+JSON under .cache/exports/. NOTE: lookup-resolved rows give the vendor name (and 統編 when looked up by id) but NOT 投標家數/落標廠商/預算/減標率 — those only come from the detail page; the 資料來源 column says which is which.`,
   {
     action: z.enum(["start", "status", "stop", "result", "list"]).describe("start=建立或續跑工作｜status=查進度｜stop=暫停｜result=取結果與匯出｜list=列出所有工作"),
     jobId: z.string().optional().describe("status／stop／result 必填；start 帶上則續跑該工作"),
@@ -718,8 +723,10 @@ server.tool(
     directory: z.enum(["off", "local", "all"]).optional().describe("start 用：名錄反查範圍。local＝只掃案件所在縣市登記的公司（預設，性價比最高）｜all＝在地掃完再掃全國（多數千次查詢、數小時）｜off＝不用名錄"),
     rankId: z.string().optional().describe("start 用：rank_by_topic 的 rankId（決標來源）。內頁改依 A→B→C 順序抓（組內分數高、金額大的先）；可對既有 jobId 加掛。免費反查不受影響"),
     skipGroupC: z.boolean().optional().describe("start 用：搭配 rankId，true＝C 組不開內頁（仍會被免費反查解出），預設 false"),
+    useMirror: z.boolean().optional().describe("start 用：是否先用 g0v 鏡像（pcc-api.openfun.app）掃日補廠商，預設 true。實測一天一請求可解掉約 92% 的案子。鏡像限個人／研究等非商業用途，要商業利用請設 false"),
+    fullDetail: z.boolean().optional().describe("start 用：廠商都處理完後，再逐案補齊決標公告的其餘欄位（標的分類含細碼、底價金額、減標率、決標日期、履約地點含地區、履約起迄），預設 false。一案一個鏡像請求（約 3 秒），564 件約 30 分鐘；只走鏡像，不佔官方內頁額度"),
   },
-  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases, directory, rankId, skipGroupC }) => {
+  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases, directory, rankId, skipGroupC, useMirror, fullDetail }) => {
     const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
     try {
       if (action === "list") {
@@ -766,9 +773,9 @@ server.tool(
               tenderName: `${c.tenderName}`, tenderWay: "", category: "", awardNoticeDate: c.awardNoticeDate,
               amount: c.amount, awardSeq: "", nonAwardSeq: "", isNonAward: false, execLocation: "",
             })),
-            { tool: "resolve_award_vendors", jobId: job.id, label: job.label, stats: job.stats, winners: rows.map(c => ({ caseNo: c.caseNo, orgName: c.orgName, winner: c.winner ?? null, winnerId: c.winnerId ?? null, source: c.source ?? null, bidderCount: c.bidderCount ?? null, losers: c.losers ?? null, budget: c.budget ?? null, totalAward: c.totalAward ?? null })) },
+            { tool: "resolve_award_vendors", jobId: job.id, label: job.label, stats: job.stats, winners: rows.map(c => ({ caseNo: c.caseNo, orgName: c.orgName, winner: c.winner ?? null, winnerId: c.winnerId ?? null, source: c.source ?? null, bidderCount: c.bidderCount ?? null, losers: c.losers ?? null, budget: c.budget ?? null, totalAward: c.totalAward ?? null, category: c.category ?? null, tenderWay: c.tenderWay ?? null, awardWay: c.awardWay ?? null, floorPrice: c.floorPrice ?? null, discountRate: c.discountRate ?? null, awardDate: c.awardDate ?? null, execArea: c.execArea ?? null, period: c.period ?? null })) },
           );
-          out += `\n**匯出：**\n- CSV：${csvPath}\n- JSON（含得標廠商、統編、落標名單、預算）：${jsonPath}\n`;
+          out += `\n**匯出：**\n- CSV：${csvPath}\n- JSON（含得標廠商、統編、落標名單、預算${job.fullDetail ? '、標的分類、底價、減標率、決標日、履約地點與起迄' : ''}）：${jsonPath}\n`;
         } catch (e: any) {
           out += `\n**匯出失敗：${e.message}**\n`;
         }
@@ -828,6 +835,8 @@ server.tool(
           seedVendors: seeds,
           directory: directory ?? "local",
           counties,
+          mirror: useMirror ?? true,
+          fullDetail: Boolean(fullDetail),
         });
       }
 
@@ -1395,6 +1404,181 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`同義詞擴充查詢失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "parse_award_html",
+  `Parse award-notice pages (決標公告內頁) that were saved to disk BY HAND and load them into this server's detail cache. This is the THIRD and last route to award details, for cases the other two cannot reach: the g0v mirror does not have the announcement (roughly 9% of cases, measured) AND the official detail page is CAPTCHA-locked. Workflow: get_award_detail reports which cases it could not retrieve and gives their links -> the user opens each link in a browser, passes the CAPTCHA, and saves with Ctrl+S as "Webpage, HTML Only" -> this tool reads those files. Filenames do NOT matter: the case is identified by the pkAtmMain in the page itself, and the fields come from the SAME parser used for live fetches, so the result is identical to a live get_award_detail (得標廠商+統編, 投標廠商家數, 落標廠商, 預算金額, 底價, 總決標金額, 減標率, 決標方式/日期, 履約地點/起迄, bidder table). Parsed cases are written to the shared cache, so afterwards get_award_detail on those same cases returns instantly, for free, and without touching the official site. Verified 2026-09-23 on 53 hand-saved pages: 53/53 parsed, all matched their case, fields agreed with the official listing. NOTES: (1) pages saved as PDF, or "Webpage, Complete" where the .html was later edited, may lose the pkAtmMain link — those are reported as not-cached rather than guessed; (2) a page saved BEFORE passing the CAPTCHA is detected and rejected, not stored as if it were data; (3) the same parse guards as live fetching apply (a 決標公告 missing 投標廠商家數 or 得標廠商 is refused), so a bad save never silently poisons the cache.`,
+  {
+    paths: z.array(z.string()).min(1).max(500).describe("HTML 檔案路徑，或含 HTML 的資料夾路徑（資料夾會自動展開，不遞迴）；1~500 個"),
+  },
+  async ({ paths }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      // 展開資料夾
+      const files: string[] = [];
+      for (const p of paths) {
+        let st;
+        try { st = await stat(p); } catch { return reply(`找不到路徑：${p}`); }
+        if (st.isDirectory()) {
+          const inner = (await readdir(p)).filter(f => /\.html?$/i.test(f)).sort((a, b) => (parseInt(a) || 0) - (parseInt(b) || 0) || a.localeCompare(b));
+          for (const f of inner) files.push(joinPath(p, f));
+        } else files.push(p);
+      }
+      if (files.length === 0) return reply(`給的路徑裡沒有 .html 檔。`);
+      if (files.length > 500) return reply(`一次最多 500 個檔，本次展開後有 ${files.length} 個，請分批。`);
+
+      const loaded: { path: string; html: string }[] = [];
+      const unreadable: string[] = [];
+      for (const f of files) {
+        try { loaded.push({ path: f, html: (await readFile(f)).toString("utf8") }); }
+        catch (e: any) { unreadable.push(`${f}（${e.code || e.message}）`); }
+      }
+
+      const { results, added, updated } = await ingestAwardHtmlFiles(loaded);
+      const okRows = results.filter(r => r.ok);
+      const bad = results.filter(r => !r.ok);
+
+      const base = (p: string) => basename(p);
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      let out = `### 人工存檔解析（${files.length} 檔）
+
+`;
+      out += `- 解析成功 ${okRows.length} 檔｜新增快取 ${added} 案、更新 ${updated} 案｜失敗 ${bad.length} 檔${unreadable.length ? `｜讀不到 ${unreadable.length} 檔` : ""}
+
+`;
+
+      if (okRows.length) {
+        out += `| 檔案 | 機關 | 案號 | 得標廠商 | 投標家數 | 決標金額 |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+`;
+        for (const r of okRows.slice(0, 60)) {
+          const rec: any = r.record;
+          const winners = rec.pageType === "award" ? rec.winners.map((w: any) => w.name).join(" / ") : "（無法決標）";
+          const n = rec.pageType === "award" ? rec.bidderCount ?? "-" : "-";
+          const amt = rec.pageType === "award" && rec.totalAward != null ? rec.totalAward.toLocaleString("en-US") : "-";
+          out += `| ${cell(base(r.file))} | ${cell(rec.orgName)} | ${cell(rec.caseNo)} | ${cell(winners)} | ${n} | ${amt} |
+`;
+        }
+        if (okRows.length > 60) out += `
+> 表格只列前 60 檔。
+`;
+      }
+      if (bad.length) {
+        out += `
+**未入快取 ${bad.length} 檔：**
+`;
+        for (const r of bad) out += `- ${cell(base(r.file))} — ${cell(r.message)}
+`;
+      }
+      if (unreadable.length) {
+        out += `
+**讀不到的檔：**
+`;
+        for (const u of unreadable) out += `- ${cell(u)}
+`;
+      }
+      if (added || updated) out += `
+> 這些案子已進快取：現在對同一批連結／pk 呼叫 get_award_detail 會直接回快取，不連線、不佔額度。
+`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`解析人工存檔失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "fill_award_category",
+  `Fill in the SUB-CODE of 標的分類 (e.g. 勞務類 / 867 建築,工程及其他技術服務(含技術監造服務) / 8672 工程服務) for every awarded case in an Excel file, writing the result to a NEW file — the source file is never modified. The award LISTING only gives the top class (勞務類); the sub-code exists only on the 決標公告 detail page, which is CAPTCHA-limited, so this tool never opens official detail pages. The sheet must have a 「pk」 column (the ?pk= part of the 決標公告 link); a 「決標公告日」 column (ROC 115/09/11 or AD) is needed for the mirror step (falls back to dates recorded by earlier search_awards calls). Per row, only if 標的細項 is still blank: (1) this server's award-detail cache — official pages and hand-saved HTML loaded by parse_award_html; these show the CURRENT notice including corrections, so they win; (2) the g0v mirror pcc-api.openfun.app (no official quota; one day-index request per distinct date plus one per case, ≥3 s apart; licensed for NON-COMMERCIAL use; may hold the PRE-correction version — measured 1 of ~400 overlapping cases differed: mirror 864, corrected notice 8672). Mirror results are cached per pk, so re-running is free. At most maxMirror cases go to the mirror per call (default ${DEFAULT_MIRROR_PER_CALL}, a few minutes); call again with the SAME path to continue — the output tells how many are still pending. Cases found nowhere (measured ~3%, mostly 契約變更 / 後續擴充 notices with -1/-2 案號 suffixes) are listed with links: the user saves each page with Ctrl+S as "Webpage, HTML Only", runs parse_award_html on the folder, then re-runs this tool. Adds/uses four columns at the right: 標的類別, 標的中類, 標的細項, 標的分類來源. 中類 groups only 52x under 「52 施工服務」 and 867x under 「867 建築,工程及其他技術服務(含技術監造服務)」 (the official code table is flat); other codes are their own 中類. Categories are what the AGENCY selected on its notice and are kept as-is even when they look wrong (e.g. a design-supervision case filed as 71 陸地運輸服務). Returns Markdown; output it verbatim.`,
+  {
+    path: z.string().describe("Excel 檔絕對路徑（要有 pk 欄；最好有 決標公告日 欄）"),
+    sheetName: z.string().optional().describe("工作表名稱；不填＝第一個有 pk 欄的工作表"),
+    maxMirror: z.number().int().min(0).max(200).optional().describe(`本次最多送幾筆去鏡像查，預設 ${DEFAULT_MIRROR_PER_CALL}（約數分鐘）；0＝只用快取`),
+    outputPath: z.string().optional().describe("輸出檔絕對路徑；不填＝來源同資料夾「原檔名_標的分類_YYYYMMDD.xlsx」，同名已存在會加時間，不覆寫"),
+  },
+  async ({ path, sheetName, maxMirror, outputPath }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      if (!isAbsolute(path)) return reply(`path 要給絕對路徑：${path}`);
+      if (outputPath && !isAbsolute(outputPath)) return reply(`outputPath 要給絕對路徑：${outputPath}`);
+      const r = await fillCategoriesInWorkbook({ path, sheetName, maxMirror, outputPath });
+      const filledNow = r.filled['決標公告內頁(快取)'] + r.filled['決標公告(鏡像)'];
+      const have = r.alreadyFilled + filledNow;
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      let out = `### 標的分類補齊｜工作表「${r.sheet}」\n\n`;
+      out += `- 共 ${r.total} 案｜原本已有 ${r.alreadyFilled}｜本次補上 ${filledNow}（內頁快取 ${r.filled['決標公告內頁(快取)']}、鏡像 ${r.filled['決標公告(鏡像)']}）｜**目前 ${have}/${r.total}**\n`;
+      out += `- 鏡像請求 ${r.mirrorRequests} 次（未動用官方內頁額度）\n`;
+      if (r.pendingMirror) out += `- ⏳ **還有 ${r.pendingMirror} 案待鏡像查詢**：對同一個 path 再呼叫一次會接著查（已查過的在快取，不重查）\n`;
+      out += `- 輸出：${r.outputPath}（原檔未修改）\n`;
+      if (r.unrecognized.length) {
+        out += `\n**分類格式認不得（未寫入）：**\n`;
+        for (const u of r.unrecognized) out += `- 第 ${u.row} 列 ${cell(u.pk)}：${cell(u.raw)}\n`;
+      }
+      if (r.missing.length) {
+        out += `\n**快取與鏡像都沒有（${r.missing.length} 案）**——請逐一開啟、通過驗證碼後按 Ctrl+S 存成「網頁，僅限 HTML」放同一個資料夾，對該資料夾跑 parse_award_html，再重跑本工具：\n\n`;
+        out += `| 列 | 機關 | 案號 | 原因 | 連結 |\n|---|---|---|---|---|\n`;
+        for (const m of r.missing.slice(0, 100)) out += `| ${m.row} | ${cell(m.org)} | ${cell(m.caseNo)} | ${cell(m.why)} | [開啟](${m.url}) |\n`;
+        if (r.missing.length > 100) out += `\n（只列前 100 案，其餘 ${r.missing.length - 100} 案重跑時會再列出）\n`;
+      }
+      return reply(out);
+    } catch (error: any) {
+      return reply(`補標的分類失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "recheck_pending_awards",
+  `Re-check award cases whose 標的分類 sub-code was NOT found earlier (e.g. rows parked in a 「待查」 list with reason 鏡像未收錄 / 鏡像當日索引無此公告). fill_award_category caches such misses for 7 days, but most of them only mean the g0v mirror had not finished indexing that day yet (it catches up 1–2 days after the 決標公告日). This tool IGNORES those cached misses, FORCE-refreshes the mirror day index once per distinct date, and looks each case up again. It never opens official detail pages (no CAPTCHA quota). Per case: (1) award-detail cache (official / parse_award_html) → (2) cached mirror hit → (3) fresh mirror lookup. Hits are written back to the category cache (so fill_award_category and later runs pick them up) and returned with the sub-code split into 類別/中類/細項 plus 機關/標案名稱/得標廠商/總決標金額/投標家數 when the mirror supplies them. Cases still not found are listed with links for the manual Ctrl+S → parse_award_html route. Input: pk values or 決標公告 links, each optionally with its 決標公告日 (ROC 115/09/29 or AD); without a date the one recorded by earlier search_awards calls is used. outputJson (optional absolute path) also saves the full result as JSON for scripts. Mirror is licensed for NON-COMMERCIAL use. Returns Markdown; output it verbatim.`,
+  {
+    cases: z.array(z.object({
+      pk: z.string().describe("決標公告 pk，或含 ?pk= / ?pkAtmMain= 的連結"),
+      date: z.string().optional().describe("決標公告日，民國 115/09/29 或西元 2026-09-29；不填＝用 search_awards 記下的日期"),
+    })).min(1).max(200).describe("要重查的案子，1~200 筆"),
+    maxMirror: z.number().int().min(0).max(200).optional().describe(`本次最多送幾筆去鏡像查，預設 ${DEFAULT_MIRROR_PER_CALL}；0＝只看快取`),
+    outputJson: z.string().optional().describe("另存完整結果 JSON 的絕對路徑（給腳本讀）；不填＝不存"),
+  },
+  async ({ cases, maxMirror, outputJson }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      if (outputJson && !isAbsolute(outputJson)) return reply(`outputJson 要給絕對路徑：${outputJson}`);
+      const norm: { pk: string; kind: "award" | "nonAward"; date?: string }[] = [];
+      const invalid: string[] = [];
+      for (const c of cases) {
+        const n = normalizeAwardInput(c.pk);
+        if (n.ok) norm.push({ pk: n.value.pk, kind: n.value.kind, date: c.date });
+        else invalid.push(`${c.pk}：${n.message}`);
+      }
+      const r = await recheckPendingCategories({ cases: norm, maxMirror });
+      if (outputJson) {
+        await mkdirAsync(pathDirname(outputJson), { recursive: true });
+        await writeFileAsync(outputJson, JSON.stringify(r, null, 1), "utf8");
+      }
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      const roc = (d: number | null) => d ? formatROCNumber(d) : "";
+      const money = (n: number | null | undefined) => n == null ? "" : n.toLocaleString("en-US");
+      let out = `### 待查重查（${r.total} 案）\n\n`;
+      out += `- 補到 ${r.resolved.length}｜仍查無 ${r.stillMissing.length}｜待下次 ${r.pendingMirror.length}\n`;
+      out += `- 鏡像請求 ${r.mirrorRequests} 次（未動用官方內頁額度）\n`;
+      if (outputJson) out += `- JSON：${outputJson}\n`;
+      if (r.resolved.length) {
+        out += `\n**補到的案子：**\n\n| pk | 決標公告日 | 標的細項 | 機關 | 標案名稱 | 得標廠商 | 總決標金額 | 來源 |\n|---|---|---|---|---|---|---|---|\n`;
+        for (const x of r.resolved) {
+          out += `| ${cell(x.pk)} | ${roc(x.date)} | ${cell(x.split?.item ?? x.raw)} | ${cell(x.orgName)} | ${cell(x.tenderName)} | ${cell((x.winners ?? []).map(w => w.name).join("、"))} | ${money(x.totalAward)} | ${x.source} |\n`;
+        }
+      }
+      if (r.stillMissing.length) {
+        out += `\n**仍查無（${r.stillMissing.length} 案）**——過一兩天再重查，或開連結過驗證碼後 Ctrl+S 存「網頁，僅限 HTML」，對資料夾跑 parse_award_html：\n\n| pk | 決標公告日 | 原因 | 連結 |\n|---|---|---|---|\n`;
+        for (const m of r.stillMissing) out += `| ${cell(m.pk)} | ${roc(m.date)} | ${cell(m.why)} | [開啟](${m.url}) |\n`;
+      }
+      if (r.pendingMirror.length) out += `\n⏳ **待下次（${r.pendingMirror.length} 案）**：超過 maxMirror（${maxMirror ?? DEFAULT_MIRROR_PER_CALL}）或鏡像連線／限速失敗，稍後再呼叫（maxMirror 要大於 0）：${r.pendingMirror.join("、")}\n`;
+      if (invalid.length) out += `\n**無法辨識、已略過（${invalid.length}）：**\n${invalid.map(s => `- ${cell(s)}`).join("\n")}\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`待查重查失敗: ${error.message}`);
     }
   }
 );

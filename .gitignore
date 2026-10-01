@@ -5,3 +5,11 @@ build/
 # 一次性的探測／匯出腳本，不進版控
 _export.mjs
 _probe_atm.mjs
+
+# 「公共工程主檔」資料專案的一次性腳本：處理私人 Excel 用，不屬於這支 MCP，
+# 而且這是公開 repo（2026-09-23 已從未推送的 commit 中移除）
+_build_main.mjs
+_fill_main.mjs
+_mark_budget_undisclosed.mjs
+_mark_id_masked.mjs
+_parse_saved.mjs

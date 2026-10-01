@@ -5,7 +5,9 @@ import { AwardCategory, AwardRow } from '../types/award.js';
 import { queryAwards, awardDedupKey } from './award-service.js';
 import { fetchAwardDetails, AWARD_DETAIL_CACHE_FILE } from './award-detail-crawler.js';
 import { loadVendorDirectory, orderByLocality } from './vendor-directory.js';
+import { fetchDayIndex, mirrorCaseKey } from './mirror-client.js';
 import { countyFromOrgName } from './award-locations.js';
+import { rocStringToNumber, formatROCNumber } from '../utils/date.js';
 
 /**
  * 批次補得標廠商。
@@ -16,6 +18,8 @@ import { countyFromOrgName } from './award-locations.js';
  * 拿已知廠商名去 gottenVendorName 反查，一次查詢就能一次解掉好幾案。
  *
  * 所以這支的策略是：
+ *   0) 鏡像掃日（最快）：g0v 鏡像的 listbydate 一個請求回一整天全部公告，含得標廠商／未得標廠商／
+ *      投標家數，所以先依案件的決標公告日逐日掃一次。實測 92% 的案子在這一步就解掉
  *   1) 反查（免費、不受流量控制）：用已知廠商名／統編反查，能解幾件算幾件
  *   2) 名錄反查（免費但量大）：拿商工登記＋建築師名冊的公司全名逐一反查，在地廠商優先
  *   3) 內頁（受限）：剩下的依決標金額由大到小逐案開，抓到新廠商名就丟回第 1 步
@@ -33,7 +37,7 @@ const WINDOW_WAIT_MS = 60_000;
 /** 內頁被驗證碼擋住時的冷卻 */
 const BLOCK_WAIT_MS = 10 * 60_000;
 
-export type ResolveSource = '內頁完整' | '反查' | '名錄反查' | '快取';
+export type ResolveSource = '內頁完整' | '鏡像' | '反查' | '名錄反查' | '快取';
 export type DirectoryMode = 'off' | 'local' | 'all';
 
 export interface ResolveCase {
@@ -53,6 +57,17 @@ export interface ResolveCase {
   totalAward?: number | null;
   source?: ResolveSource;
   message?: string;
+  /** 以下是 fullDetail 才會填：決標公告內頁有、清單頁與鏡像日索引都沒有的欄位 */
+  category?: string;
+  tenderWay?: string;
+  awardWay?: string;
+  floorPrice?: number | null;
+  discountRate?: number | null;
+  awardDate?: string;
+  execArea?: string;
+  period?: string;
+  /** 已補過完整欄位，續跑時不重抓 */
+  detailed?: boolean;
 }
 
 export interface ResolveJob {
@@ -69,7 +84,16 @@ export interface ResolveJob {
   vendorQueue: string[];
   /** 已反查過的，不重複查 */
   triedVendors: string[];
-  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number; solvedByDirectory?: number };
+  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number; solvedByDirectory?: number; solvedByMirror?: number; detailed?: number; detailFailed?: number };
+  /** 補完廠商後，再逐案把決標公告的其餘欄位抓齊（標的分類、底價、決標日、履約地點…） */
+  fullDetail?: boolean;
+  /** 鏡像掃日；舊版工作檔沒有這欄，視同未啟用 */
+  mirror?: {
+    enabled: boolean;
+    /** 已掃過的決標公告日（民國 yyyMMdd），續跑時不重掃 */
+    done: number[];
+    requests: number;
+  };
   /** 名錄反查；舊版工作檔沒有這欄，視同 off */
   directory?: {
     mode: DirectoryMode;
@@ -170,6 +194,10 @@ export interface CreateJobInput {
   directory?: DirectoryMode;
   /** 名錄在地優先用；不給就從機關名稱推 */
   counties?: string[];
+  /** 先用 g0v 鏡像掃日補廠商，預設開啟（鏡像限非商業用途） */
+  mirror?: boolean;
+  /** 廠商補完後再逐案補齊決標公告的其餘欄位，預設關閉（一案一請求，慢很多） */
+  fullDetail?: boolean;
 }
 
 export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
@@ -198,7 +226,9 @@ export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
     cases,
     vendorQueue: [...new Set(input.seedVendors ?? [])],
     triedVendors: [],
-    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0, solvedByDirectory: 0 },
+    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0, solvedByDirectory: 0, solvedByMirror: 0, detailed: 0, detailFailed: 0 },
+    mirror: { enabled: input.mirror ?? true, done: [], requests: 0 },
+    fullDetail: Boolean(input.fullDetail),
     directory: {
       mode: input.directory ?? 'off',
       counties: input.counties?.length ? input.counties : inferCounties(cases),
@@ -316,6 +346,88 @@ async function fetchOneDetail(job: ResolveJob, target: ResolveCase): Promise<'ok
   return 'failed';
 }
 
+/** 還沒掃過的決標公告日，依未解案件最多的日子優先（一次請求解最多件） */
+function nextMirrorDate(job: ResolveJob): number | null {
+  const done = new Set(job.mirror?.done ?? []);
+  const tally = new Map<number, number>();
+  for (const c of job.cases) {
+    if (c.status !== 'unknown') continue;
+    const d = rocStringToNumber(c.awardNoticeDate);
+    if (d == null || done.has(d)) continue;
+    tally.set(d, (tally.get(d) ?? 0) + 1);
+  }
+  if (tally.size === 0) return null;
+  return [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+}
+
+/** 掃一天的鏡像，把命中的案子就地解掉。回傳這天解出幾件 */
+async function mirrorScanDay(job: ResolveJob, date: number): Promise<{ hit: number; error?: string }> {
+  const r = await fetchDayIndex(date);
+  const mirror = job.mirror!;
+  mirror.requests += r.requests;
+  // 失敗的日子也標記成掃過，避免同一天一直重試卡住整個工作；剩下的交給後面的反查與內頁
+  mirror.done.push(date);
+  if (r.error) return { hit: 0, error: r.error };
+
+  const found = new Set<string>();
+  let hit = 0;
+  for (const c of job.cases) {
+    if (c.status !== 'unknown') continue;
+    if (rocStringToNumber(c.awardNoticeDate) !== date) continue;
+    const m = r.index.get(mirrorCaseKey(c.orgName, c.caseNo));
+    if (!m) continue;
+    c.status = 'resolved';
+    c.winner = m.winners.join(' / ');
+    c.winnerId = m.winnerIds.filter(Boolean).join(' / ') || null;
+    c.bidderCount = m.bidderCount;
+    c.losers = m.losers;
+    c.source = '鏡像';
+    hit++;
+    for (const n of m.winners) found.add(n);
+  }
+  // 鏡像查不到的多是變更設計／後續擴充，得標廠商通常就是原案那家，所以把本批解出的廠商留給反查用。
+  // 只收「本批案子」的得標廠商，不收整天的（整天動輒一千多家，為了十幾件案子空跑一小時不划算）
+  if (job.cases.some(c => c.status === 'unknown')) {
+    for (const n of found) {
+      if (!job.triedVendors.includes(n) && !job.vendorQueue.includes(n)) job.vendorQueue.push(n);
+    }
+  }
+  return { hit };
+}
+
+/**
+ * fullDetail：逐案把決標公告其餘欄位補齊（標的分類、底價、減標率、決標日、履約地點與起迄）。
+ * 只走鏡像（mirrorOnly），鏡像沒有的就標記跳過——不拿官方那 5 次/10 分鐘的額度來換這些欄位，
+ * 那個額度要留給真的只能開官方內頁的案子。
+ */
+async function fillOneDetail(job: ResolveJob, c: ResolveCase): Promise<'ok' | 'miss'> {
+  const batch = await fetchAwardDetails([c.url || c.pk], { mirrorOnly: true });
+  // 這步也在打鏡像，要計進同一份連線統計，否則摘要會低報實際成本
+  if (job.mirror) job.mirror.requests += batch.mirrorRequests;
+  const r = batch.results[0];
+  if (!r?.ok || !r.record || r.record.pageType !== 'award') {
+    c.detailed = true; // 標記處理過，免得續跑時卡在同一筆
+    job.stats.detailFailed = (job.stats.detailFailed ?? 0) + 1;
+    return 'miss';
+  }
+  const rec = r.record;
+  c.category = rec.category;
+  c.tenderWay = rec.tenderWay;
+  c.awardWay = rec.awardWay;
+  c.floorPrice = rec.floorPrice;
+  c.discountRate = rec.discountRate;
+  c.awardDate = rec.awardDate;
+  c.execArea = rec.execArea;
+  c.period = rec.period;
+  // 這些欄位鏡像日索引給不了，逐案抓才有；既有值不覆寫
+  if (c.budget == null) c.budget = rec.budget;
+  if (c.totalAward == null) c.totalAward = rec.totalAward;
+  if (c.bidderCount == null) c.bidderCount = rec.bidderCount;
+  c.detailed = true;
+  job.stats.detailed = (job.stats.detailed ?? 0) + 1;
+  return 'ok';
+}
+
 /** 背景工作：反查與內頁交替，直到全解完或被叫停 */
 export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Promise<void> {
   const deadline = Date.now() + (opts.maxMinutes ?? 720) * 60_000;
@@ -329,8 +441,23 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       return;
     }
 
-    // 1. 先把免費的反查做完
-    const vendor = job.vendorQueue.shift();
+    // 0. 鏡像掃日：一個請求就回一整天全部公告（含得標／未得標廠商、投標家數），最划算，排最前面
+    if (job.mirror?.enabled) {
+      const date = nextMirrorDate(job);
+      if (date != null) {
+        const { hit, error } = await mirrorScanDay(job, date);
+        job.stats.solvedByMirror = (job.stats.solvedByMirror ?? 0) + hit;
+        recount(job);
+        job.message = error
+          ? `鏡像 ${formatROCNumber(date)} 取得失敗：${error}（該日改由反查／內頁處理）｜已解 ${job.stats.resolved}/${job.stats.total}`
+          : `鏡像 ${formatROCNumber(date)} 命中 ${hit} 件｜已解 ${job.stats.resolved}/${job.stats.total}`;
+        await saveJob(job);
+        continue;
+      }
+    }
+
+    // 1. 先把免費的反查做完（全部解完就不用再反查了——鏡像會把整天的廠商名都丟進佇列，不擋會空跑幾百次）
+    const vendor = job.cases.some(c => c.status === 'unknown') ? job.vendorQueue.shift() : undefined;
     if (vendor) {
       job.triedVendors.push(vendor);
       try {
@@ -393,13 +520,31 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       }
     }
 
+    // 2.5 補齊欄位。位置就是條件：能跑到這裡代表免費的反查與名錄都做完了，
+    // 所以排在受流量控制的內頁之前、免費步驟之後。
+    // ⚠ 不要再加「所有案子都已解」的條件：實測只要有一件廠商始終補不到（要等它
+    // 一路走到內頁、撞額度、被標成 failed），其餘案子的欄位就會一直等不到，
+    // 而那些案子的欄位跟那一件解不解得出來根本無關。
+    if (job.fullDetail) {
+      const next = job.cases.find(c => c.status === 'resolved' && !c.detailed);
+      if (next) {
+        const r = await fillOneDetail(job, next);
+        const left = job.cases.filter(c => c.status === 'resolved' && !c.detailed).length;
+        job.message = `補欄位 ${next.caseNo}：${r === 'ok' ? next.category || '已補' : '鏡像沒有，略過'}｜已補 ${job.stats.detailed ?? 0}／略過 ${job.stats.detailFailed ?? 0}／剩 ${left}`;
+        await saveJob(job);
+        continue;
+      }
+    }
+
     // 3. 反查做完了，剩下的走內頁：有排名就 A→B→C（組內分數高、金額大的先），沒有就金額大的先
     const { pending, skipped } = detailQueue(job);
-    if (pending.length === 0) {
+    const detailLeft = job.fullDetail ? job.cases.filter(c => c.status === 'resolved' && !c.detailed).length : 0;
+    if (pending.length === 0 && detailLeft === 0) {
       recount(job);
       job.state = 'done';
       job.message = `完成：已解 ${job.stats.resolved}/${job.stats.total}${job.stats.failed ? `，失敗 ${job.stats.failed}` : ''}`
-        + (skipped ? `｜C 組 ${skipped} 件依 skipGroupC 設定未開內頁（仍未解）` : '');
+        + (skipped ? `｜C 組 ${skipped} 件依 skipGroupC 設定未開內頁（仍未解）` : '')
+        + (job.fullDetail ? `｜欄位已補 ${job.stats.detailed ?? 0} 件${job.stats.detailFailed ? `、鏡像沒有 ${job.stats.detailFailed} 件` : ''}` : '');
       await saveJob(job);
       return;
     }
@@ -468,8 +613,8 @@ export function jobSummary(job: ResolveJob): string {
   return [
     `- 狀態：${job.state === 'running' ? '執行中' : job.state === 'done' ? '已完成' : job.state === 'paused' ? '已暫停' : '錯誤'}｜${job.message}`,
     `- 進度：${fmt(s.resolved)} / ${fmt(s.total)} 件（${pct}%）｜金額涵蓋 ${fmt(gotAmt)} / ${fmt(totalAmt)} 元`,
-    `- 來源：反查解出 ${fmt(s.solvedByLookup)} 件（免費）｜名錄反查解出 ${fmt(s.solvedByDirectory ?? 0)} 件（免費）｜內頁解出 ${fmt(s.solvedByDetail)} 件（受流量控制）｜失敗 ${fmt(s.failed)} 件`,
-    `- 連線：清單端點 ${fmt(s.lookups)} 次｜內頁 ${fmt(s.detailFetches)} 次`,
+    `- 來源：鏡像解出 ${fmt(s.solvedByMirror ?? 0)} 件（一天一請求）｜反查解出 ${fmt(s.solvedByLookup)} 件（免費）｜名錄反查解出 ${fmt(s.solvedByDirectory ?? 0)} 件（免費）｜內頁解出 ${fmt(s.solvedByDetail)} 件（受流量控制）｜失敗 ${fmt(s.failed)} 件`,
+    `- 連線：清單端點 ${fmt(s.lookups)} 次｜內頁 ${fmt(s.detailFetches)} 次｜鏡像 ${fmt(job.mirror?.requests ?? 0)} 次${job.mirror?.enabled ? `（已掃 ${fmt(job.mirror.done.length)} 天）` : '（未啟用）'}`,
     `- 待解 ${fmt(unknown.length)} 件；反查佇列尚有 ${fmt(job.vendorQueue.length)} 家廠商`
       + (job.directory && job.directory.mode !== 'off'
         ? `；名錄 ${job.directory.built ? `${fmt(job.directory.tried)}/${fmt(job.directory.total)} 家` : '尚未載入'}`
@@ -479,6 +624,7 @@ export function jobSummary(job: ResolveJob): string {
       for (const c of unknown) { const r = job.priority!.ranks[c.pk]; if (r) g[r.group]++; else g.none++; }
       return `- 內頁順序：依排名 \`${job.priority.rankId}\`（${job.priority.topic}）A→B→C｜待解 A ${fmt(g.A)}／B ${fmt(g.B)}／C ${fmt(g.C)}${g.none ? `／不在排名 ${fmt(g.none)}（排在 B 之後）` : ''}${job.priority.skipGroupC ? '｜C 組不開內頁' : ''}`;
     })()] : []),
+    ...(job.fullDetail ? [`- 補欄位：已補 ${fmt(s.detailed ?? 0)} 件（標的分類／底價／減標率／決標日／履約地點）｜鏡像沒有 ${fmt(s.detailFailed ?? 0)} 件｜待補 ${fmt(job.cases.filter(c => c.status === 'resolved' && !c.detailed).length)} 件`] : []),
     `- 更新時間 ${job.updatedAt}`,
   ].join('\n');
 }

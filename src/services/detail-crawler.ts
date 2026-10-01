@@ -14,7 +14,8 @@ import { TenderDetail } from '../types/tender.js';
  * 因此這裡的策略是「省著用」而不是「想辦法多抓」：
  *   1. 本地快取，同一案永不重抓
  *   2. 單次上限 8 筆、序列抓取並節流
- *   3. 一遇驗證碼立刻中止整批（繼續打只是徒增負擔），未完成的誠實回報
+ *   3. 跨呼叫滾動額度（5 分鐘 20 次）——單次上限擋不住「連續呼叫十次」
+ *   4. 一遇驗證碼立刻中止整批，並冷卻 20 分鐘才再送請求；未完成的誠實回報
  * 絕不繞過或破解驗證碼。
  */
 
@@ -24,6 +25,53 @@ const DETAIL_BASE = 'https://web.pcc.gov.tw/tps/QueryTender/query/searchTenderDe
 export const MAX_FETCH_PER_CALL = 8;
 /** 連續請求間隔（毫秒） */
 const THROTTLE_MS = 1500;
+
+/**
+ * 跨呼叫的滾動額度。單次上限只擋得住一次呼叫，擋不住「連續呼叫十次」——
+ * 決標內頁就是這樣被鎖掉的（2026-09-14 起連鎖多日），而招標內頁是目前唯一還能用的內頁。
+ * 額度取自 2026-09-22 實測：15 秒間隔連抓 17 筆未被擋 → 平均 15 秒/筆＝5 分鐘 20 筆，
+ * 既維持互動查詢的手感（單次 8 筆仍是 1.5 秒間隔、12 秒抓完），又擋掉把 MCP 當爬蟲用的情境。
+ * 大量補資料請寫獨立腳本，不要迴圈呼叫本工具。
+ */
+export const TENDER_WINDOW_MAX = 20;
+export const TENDER_WINDOW_MS = 5 * 60 * 1000;
+/** 撞到驗證碼後，整個工具冷卻這麼久（網站鎖 20 分鐘以上，期間再打只會延長封鎖） */
+export const TENDER_COOLDOWN_MS = 20 * 60 * 1000;
+
+let windowStamps: number[] = [];
+let blockedUntil = 0;
+
+/**
+ * 只給驗收腳本用：清空額度與冷卻狀態。
+ * seedUsed 預先塞入 N 筆「剛剛送出」的紀錄，用來驗證額度用完的分支（否則要真的打 20 次網路請求）；
+ * seedBlockedMs 則把冷卻設在 N 毫秒之後。
+ */
+export function resetTenderDetailWindow(seedUsed = 0, seedBlockedMs = 0): void {
+  const now = Date.now();
+  windowStamps = Array.from({ length: seedUsed }, () => now);
+  blockedUntil = seedBlockedMs ? now + seedBlockedMs : 0;
+}
+
+/** 目前額度狀態（驗收與回報用）。used 是滾動視窗內已送出的請求數 */
+export function getTenderDetailQuota(): { used: number; max: number; windowMs: number; blockedUntil: number } {
+  const now = Date.now();
+  windowStamps = windowStamps.filter(t => t > now - TENDER_WINDOW_MS);
+  return { used: windowStamps.length, max: TENDER_WINDOW_MAX, windowMs: TENDER_WINDOW_MS, blockedUntil };
+}
+
+/** 額度已滿時回傳最早可再請求的時刻（ms），還有額度回 0 */
+function windowFullUntil(now: number): number {
+  windowStamps = windowStamps.filter(t => t > now - TENDER_WINDOW_MS);
+  return windowStamps.length >= TENDER_WINDOW_MAX ? Math.min(...windowStamps) + TENDER_WINDOW_MS : 0;
+}
+
+/** 無條件進位到整分，照著顯示的時間來查一定已有額度 */
+function taipeiHHmm(ms: number): string {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(Math.ceil(ms / 60000) * 60000)).map(x => [x.type, x.value]));
+  return `${p.hour}:${p.minute}`;
+}
 
 // build 後此檔在 build/services/，快取固定放專案根的 .cache/
 // ⚠️ 不可用 process.cwd()：MCP 由 GUI 啟動時 CWD 是 C:\Windows\System32，寫入會被拒
@@ -173,12 +221,27 @@ export async function fetchTenderDetails(inputs: string[]): Promise<{ details: T
       details.push({ input, pk, url, ok: false, reason: 'captcha', fields: {}, cached: false });
       continue;
     }
+    const now = Date.now();
+    if (now < blockedUntil) {
+      details.push({ input, pk, url, ok: false, reason: 'captcha',
+        message: `先前已撞到驗證碼，本工具冷卻至 ${taipeiHHmm(blockedUntil)} 才會再送請求（期間再打只會延長封鎖）。已快取的案子不受影響。`,
+        fields: {}, cached: false });
+      continue;
+    }
     if (fetched >= MAX_FETCH_PER_CALL) {
       details.push({ input, pk, url, ok: false, reason: 'error', message: `超過單次抓取上限（${MAX_FETCH_PER_CALL} 筆），請分批查詢`, fields: {}, cached: false });
       continue;
     }
+    const until = windowFullUntil(now);
+    if (until) {
+      details.push({ input, pk, url, ok: false, reason: 'error',
+        message: `任意 ${TENDER_WINDOW_MS / 60000} 分鐘內最多 ${TENDER_WINDOW_MAX} 次內頁請求（跨呼叫共用），最早可在 ${taipeiHHmm(until)} 再查。要大量補資料請改寫獨立腳本，不要迴圈呼叫本工具。`,
+        fields: {}, cached: false });
+      continue;
+    }
 
     if (fetched > 0) await sleep(THROTTLE_MS);
+    windowStamps.push(Date.now());
     const r = await fetchOne(pk);
     fetched++;
 
@@ -187,7 +250,7 @@ export async function fetchTenderDetails(inputs: string[]): Promise<{ details: T
       dirty = true;
       details.push({ input, pk, url, ok: true, fields: r.fields, cached: false });
     } else {
-      if (r.reason === 'captcha') blocked = true; // 之後的一律不再打
+      if (r.reason === 'captcha') { blocked = true; blockedUntil = Date.now() + TENDER_COOLDOWN_MS; } // 之後的一律不再打
       details.push({ input, pk, url, ok: false, reason: r.reason, message: r.message, fields: {}, cached: false });
     }
   }

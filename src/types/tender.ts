@@ -96,6 +96,8 @@ export interface ArchiveTender {
   awardDate: string;
   /** 截止投標日期 */
   endDate: string;
+  /** 公開閱覽／公開徵求期間原文，例「115/09/24 ~ 115/10/02」；其他種類為空 */
+  readPeriod: string;
   /** 這筆是從哪個民國年度的公報查到的 */
   year: number;
   /** 標案內頁連結（tpam?pk=…，可直接餵 get_tender_detail） */
